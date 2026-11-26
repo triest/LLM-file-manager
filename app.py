@@ -1,7 +1,8 @@
-"""Local-first file manager prototype. Python 3.10+, standard library only."""
+"""Local-first file manager. Python 3.10+; standard-library core plus local document adapters."""
 from __future__ import annotations
 
 import json
+import base64
 import difflib
 import os
 import queue
@@ -25,7 +26,8 @@ import tkinter as tk
 import xml.etree.ElementTree as ET
 
 APP_NAME = "Локальный файловый менеджер"
-SUPPORTED = {".txt", ".md", ".rst", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".py", ".js", ".ts", ".css", ".log", ".ini", ".yaml", ".yml", ".toml", ".rtf", ".docx", ".xlsx", ".xlsm", ".xls", ".xlsb", ".pptx", ".odt", ".ods", ".odp", ".pdf", ".sql", ".sh", ".ps1", ".bat", ".cs", ".java", ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".jsx", ".tsx", ".vue", ".svelte", ".php", ".rb", ".swift", ".kt", ".properties", ".env"}
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+SUPPORTED = {".txt", ".md", ".rst", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".py", ".js", ".ts", ".css", ".log", ".ini", ".yaml", ".yml", ".toml", ".rtf", ".docx", ".xlsx", ".xlsm", ".xls", ".xlsb", ".pptx", ".odt", ".ods", ".odp", ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".sql", ".sh", ".ps1", ".bat", ".cs", ".java", ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".jsx", ".tsx", ".vue", ".svelte", ".php", ".rb", ".swift", ".kt", ".properties", ".env"}
 MAX_TEXT = 500_000
 OLLAMA_URL = "http://127.0.0.1:11434"
 EDITABLE_TEXT = {".txt", ".md", ".rst", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".py", ".js", ".ts", ".css", ".log", ".ini", ".yaml", ".yml", ".toml", ".sql", ".sh", ".ps1", ".bat", ".cs", ".java", ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".jsx", ".tsx", ".vue", ".svelte", ".php", ".rb", ".swift", ".kt", ".properties", ".env"}
@@ -68,43 +70,142 @@ def xml_text(data: bytes) -> str:
         return ""
 
 
-def extract_legacy_excel(path: Path) -> str:
-    """Read binary Excel formats with optional local parsers."""
+def load_excel_workbook_for_edit(path: Path):
+    """Load a spreadsheet into an editable workbook; legacy formats become XLSX data copies."""
+    from openpyxl import Workbook, load_workbook
     ext = path.suffix.lower()
-    try:
-        if ext == ".xls":
-            import xlrd
-            book = xlrd.open_workbook(str(path), on_demand=True)
-            chunks = []; total = 0
-            for sheet in book.sheets():
-                chunks.append(sheet.name)
-                total += len(sheet.name)
-                for row in sheet.get_rows():
-                    line = "\t".join(str(cell.value) for cell in row if cell.value not in (None, ""))
-                    if line: chunks.append(line); total += len(line)
-                    if total >= MAX_TEXT: break
-                if total >= MAX_TEXT: break
-            book.release_resources()
-            return "\n".join(chunks)[:MAX_TEXT]
+    if ext in {".xlsx", ".xlsm"}:
+        return load_workbook(path, data_only=False, keep_vba=ext == ".xlsm")
+    output = Workbook()
+    if ext == ".xls":
+        import xlrd
+        source = xlrd.open_workbook(str(path), on_demand=True)
+        sheets = source.sheets()
+        if not sheets: return output
+        output.active.title = sheets[0].name[:31] or "Sheet1"
+        targets = [output.active]
+        for sheet in sheets[1:]: targets.append(output.create_sheet(sheet.name[:31] or "Sheet"))
+        for sheet, target in zip(sheets, targets):
+            for row in range(sheet.nrows):
+                for col in range(sheet.ncols):
+                    cell = sheet.cell(row, col)
+                    if cell.ctype != xlrd.XL_CELL_EMPTY:
+                        target.cell(row + 1, col + 1).value = cell.value
+        source.release_resources()
+        return output
+    if ext == ".xlsb":
         import pyxlsb
-        chunks = []; total = 0
-        with pyxlsb.open_workbook(str(path)) as book:
-            for sheet_name in book.sheets:
-                chunks.append(sheet_name)
-                total += len(sheet_name)
-                with book.get_sheet(sheet_name) as sheet:
+        from openpyxl.utils import get_column_letter
+        with pyxlsb.open_workbook(str(path)) as source:
+            for index, name in enumerate(source.sheets):
+                target = output.active if index == 0 else output.create_sheet()
+                target.title = (name[:31] or f"Sheet{index + 1}")
+                with source.get_sheet(name) as sheet:
                     for row in sheet.rows():
-                        values = [str(cell.v) for cell in row if cell.v not in (None, "")]
-                        if values:
-                            line = "\t".join(values); chunks.append(line); total += len(line)
-                        if total >= MAX_TEXT: break
-                if total >= MAX_TEXT: break
-        return "\n".join(chunks)[:MAX_TEXT]
-    except ImportError:
-        package = "xlrd" if ext == ".xls" else "pyxlsb"
-        return f"[Для чтения {ext} установите локальный компонент {package} командой: python -m pip install -r requirements.txt]"
-    except (OSError, ValueError, zipfile.BadZipFile, KeyError):
-        return ""
+                        for cell in row:
+                            if cell.v is not None:
+                                target.cell(cell.r + 1, cell.c + 1).value = cell.v
+        return output
+    raise ValueError(f"Формат {ext} нельзя редактировать как таблицу")
+
+
+def excel_workbook_text(path: Path, max_chars=MAX_TEXT) -> str:
+    """Create a bounded, cell-addressed local context for spreadsheet chat/editing."""
+    from openpyxl.utils import get_column_letter
+    ext = path.suffix.lower(); chunks = []; used = 0; nonempty = 0
+    if ext in {".xlsx", ".xlsm"}:
+        from openpyxl import load_workbook
+        workbook = load_workbook(path, read_only=True, data_only=False, keep_vba=ext == ".xlsm")
+        try:
+            for sheet in workbook.worksheets:
+                chunks.append(f"\n## Лист: {sheet.title}")
+                max_row, max_col = min(sheet.max_row or 0, 10000), min(sheet.max_column or 0, 100)
+                for row in sheet.iter_rows(max_row=max_row, max_col=max_col):
+                    for cell in row:
+                        if cell.value is None: continue
+                        line = f"{cell.coordinate}: {cell.value}"
+                        if used + len(line) > max_chars or nonempty >= 10000: return "\n".join(chunks) + "\n[контекст таблицы ограничен]"
+                        chunks.append(line); used += len(line); nonempty += 1
+        finally: workbook.close()
+    elif ext == ".xls":
+        import xlrd
+        source = xlrd.open_workbook(str(path), on_demand=True)
+        try:
+            for sheet in source.sheets():
+                chunks.append(f"\n## Лист: {sheet.name}")
+                for row in range(min(sheet.nrows, 10000)):
+                    for col in range(min(sheet.ncols, 100)):
+                        value = sheet.cell_value(row, col)
+                        if value in (None, ""): continue
+                        line = f"{get_column_letter(col + 1)}{row + 1}: {value}"
+                        if used + len(line) > max_chars or nonempty >= 10000: return "\n".join(chunks) + "\n[контекст таблицы ограничен]"
+                        chunks.append(line); used += len(line); nonempty += 1
+        finally: source.release_resources()
+    elif ext == ".xlsb":
+        import pyxlsb
+        with pyxlsb.open_workbook(str(path)) as source:
+            for name in source.sheets:
+                chunks.append(f"\n## Лист: {name}")
+                with source.get_sheet(name) as sheet:
+                    for row in sheet.rows():
+                        for cell in row:
+                            if cell.v is None: continue
+                            line = f"{get_column_letter(cell.c + 1)}{cell.r + 1}: {cell.v}"
+                            if used + len(line) > max_chars or nonempty >= 10000: return "\n".join(chunks) + "\n[контекст таблицы ограничен]"
+                            chunks.append(line); used += len(line); nonempty += 1
+    return "\n".join(chunks)[:max_chars]
+
+
+def validate_excel_operations(path: Path, plan: dict):
+    from openpyxl.utils.cell import coordinate_to_tuple
+    operations = plan.get("operations") if isinstance(plan, dict) else None
+    if operations is None and isinstance(plan, dict) and isinstance(plan.get("cells"), dict):
+        operations = []
+        for address, entry in plan["cells"].items():
+            if not isinstance(address, str) or "!" not in address: raise ValueError("Ячейка в плане должна иметь адрес Лист!A1")
+            sheet, cell = address.rsplit("!", 1)
+            value = entry.get("value") if isinstance(entry, dict) and set(entry) == {"value"} else entry
+            operations.append({"sheet": sheet, "cell": cell, "value": value})
+    if not isinstance(operations, list) or not operations or len(operations) > 2000:
+        raise ValueError("Нужен список из 1–2000 точечных изменений ячеек")
+    workbook = load_excel_workbook_for_edit(path)
+    validated = []; seen = set()
+    try:
+        for operation in operations:
+            if not isinstance(operation, dict) or set(operation) != {"sheet", "cell", "value"}:
+                raise ValueError("Каждое изменение должно содержать только лист, ячейку и новое значение")
+            sheet_name, coordinate, value = operation["sheet"], operation["cell"], operation["value"]
+            if not isinstance(sheet_name, str) or sheet_name not in workbook.sheetnames:
+                raise ValueError(f"Неизвестный лист: {sheet_name!r}")
+            if not isinstance(coordinate, str): raise ValueError("Неверный адрес ячейки")
+            row, col = coordinate_to_tuple(coordinate.upper())
+            if row > 1_048_576 or col > 16_384: raise ValueError("Адрес ячейки выходит за границы Excel")
+            key = (sheet_name, coordinate.upper())
+            if key in seen: raise ValueError(f"Повторная правка ячейки {sheet_name}!{coordinate}")
+            seen.add(key)
+            if isinstance(value, (dict, list)) or value is None or not isinstance(value, (str, int, float, bool)):
+                raise ValueError("Ячейка должна получить текст, число или логическое значение")
+            if isinstance(value, str) and len(value) > 10000: raise ValueError("Значение ячейки превышает 10 000 символов")
+            if isinstance(value, float) and (value != value or abs(value) == float("inf")): raise ValueError("Недопустимое число")
+            old = workbook[sheet_name][coordinate.upper()].value
+            if workbook[sheet_name][coordinate.upper()].__class__.__name__ == "MergedCell":
+                raise ValueError(f"Ячейка {sheet_name}!{coordinate} входит в объединённый диапазон и недоступна для изменения")
+            validated.append({"sheet": sheet_name, "cell": coordinate.upper(), "value": value, "old": old})
+    finally: workbook.close()
+    return validated
+
+
+def write_excel_operations(source: Path, target: Path, operations: list[dict]):
+    workbook = load_excel_workbook_for_edit(source)
+    try:
+        for operation in operations:
+            if operation["sheet"] not in workbook.sheetnames: raise ValueError("Лист изменился после проверки")
+            cell = workbook[operation["sheet"]][operation["cell"]]
+            if cell.value != operation.get("old"):
+                raise ValueError(f"Ячейка {operation['sheet']}!{operation['cell']} изменилась после предпросмотра; создайте правку заново")
+            cell.value = operation["value"]
+        workbook.save(target)
+    finally: workbook.close()
 
 
 def docx_paragraphs(path: Path):
@@ -167,6 +268,20 @@ def read_editable_text(path: Path):
     return raw.decode(encoding), encoding
 
 
+def is_plain_text_file(path: Path):
+    """Format-independent fallback for user supplied text and source files."""
+    try:
+        with path.open("rb") as stream: sample = stream.read(8192)
+        if not sample: return True
+        if sample.startswith((b"\xff\xfe", b"\xfe\xff", b"\xef\xbb\xbf")): return True
+        if b"\0" in sample: return False
+        try: decoded = sample.decode("utf-8")
+        except UnicodeDecodeError: decoded = sample.decode("cp1251")
+        visible = sum(char.isprintable() or char in "\r\n\t" for char in decoded)
+        return visible / max(1, len(decoded)) >= 0.9
+    except OSError: return False
+
+
 def extract_json_object(response: str):
     cleaned = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
     start = cleaned.find("{")
@@ -175,16 +290,29 @@ def extract_json_object(response: str):
     return result
 
 
+def extract_file_search_query(prompt: str):
+    """Recognize a natural-language request to find a local file and retain identifying terms."""
+    lowered = prompt.casefold()
+    intents = ("найди", "найти", "поищи", "отыщи", "где лежит", "где находится", "где найти")
+    if not any(word in lowered for word in intents): return None
+    local_file_context = ("комп" in lowered or "диск" in lowered or "папк" in lowered or "файл" in lowered or
+                          "документ" in lowered or "где лежит" in lowered or "где находится" in lowered)
+    if not local_file_context: return None
+    stop = {"найди", "найти", "поищи", "отыщи", "где", "лежит", "находится", "у", "меня", "на", "в", "во", "по", "про", "для", "из", "с", "от", "моем", "моём", "компе", "компьютере", "диске", "где-то", "гдето", "пожалуйста", "мне", "его", "ее", "её", "тот", "этот", "и", "или", "моя", "моей", "мой", "мое", "моё"}
+    terms = [word for word in re.findall(r"[\w.-]+", lowered, flags=re.UNICODE) if len(word) > 1 and word not in stop]
+    return terms or []
+
+
 def extract_text(path: Path) -> str:
     ext = path.suffix.lower()
     try:
-        if ext in {".xls", ".xlsb"}: return extract_legacy_excel(path)
-        if ext in {".docx", ".xlsx", ".xlsm", ".pptx", ".odt", ".ods", ".odp"}:
+        if ext in IMAGE_EXTS: return ""
+        if ext in {".xlsx", ".xlsm", ".xls", ".xlsb"}: return excel_workbook_text(path)
+        if ext in {".docx", ".pptx", ".odt", ".ods", ".odp"}:
             chunks = []
             with zipfile.ZipFile(path) as archive:
                 names = archive.namelist()
                 if ext == ".docx": names = [n for n in names if re.fullmatch(r"word/(document|header\d+|footer\d+|footnotes|endnotes)\.xml", n)]
-                elif ext in {".xlsx", ".xlsm"}: names = [n for n in names if n == "xl/sharedStrings.xml" or re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n)]
                 elif ext == ".pptx": names = [n for n in names if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)]
                 else: names = [n for n in names if re.fullmatch(r"content\.xml", n)]
                 for name in names[:300]:
@@ -200,6 +328,8 @@ def extract_text(path: Path) -> str:
         if ext in {".html", ".htm"}: raw = clean_html(raw)
         elif ext == ".rtf": raw = re.sub(r"\\[a-z]+-?\d* ?|[{}]", " ", raw)
         return raw[:MAX_TEXT]
+    except ImportError:
+        return "[Для работы с Excel установите компоненты командой: python -m pip install -r requirements.txt]"
     except (OSError, ValueError, zipfile.BadZipFile, KeyError, RuntimeError):
         return ""
 
@@ -207,7 +337,7 @@ def extract_text(path: Path) -> str:
 class Index:
     def __init__(self):
         self.db = sqlite3.connect(app_data() / "files.sqlite3", check_same_thread=False)
-        self.db.create_function("CASEFOLD", 1, lambda value: str(value or "").casefold())
+        self.db.create_function("CASEFOLD", 1, search_fold)
         self.lock = threading.Lock()
         with self.db:
             self.db.execute("CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, name TEXT, ext TEXT, size INTEGER, mtime REAL, body TEXT)")
@@ -243,9 +373,25 @@ class Index:
             else:
                 words = [w.strip() for w in query.split() if len(w.strip()) > 1][:8]
                 clauses = " AND ".join(["(CASEFOLD(name) LIKE ? OR CASEFOLD(body) LIKE ? OR CASEFOLD(path) LIKE ?)"] * len(words))
-                args = [v for word in words for v in (f"%{word.casefold()}%", f"%{word.casefold()}%", f"%{word.casefold()}%")]
+                args = [v for word in words for v in (f"%{search_fold(word)}%", f"%{search_fold(word)}%", f"%{search_fold(word)}%")]
                 rows = self.db.execute(f"SELECT path,name,ext,size,mtime,body FROM files WHERE {clauses} ORDER BY mtime DESC LIMIT ?", (*args, limit)).fetchall() if words else []
         return rows
+
+    def find_relevant(self, terms: list[str], limit=10):
+        if not terms: return []
+        terms = list(dict.fromkeys(search_fold(term) for term in terms))[:12]
+        clauses = " OR ".join(["(CASEFOLD(name) LIKE ? OR CASEFOLD(body) LIKE ? OR CASEFOLD(path) LIKE ?)"] * len(terms))
+        args = [value for term in terms for value in (f"%{term}%", f"%{term}%", f"%{term}%")]
+        with self.lock:
+            rows = self.db.execute(f"SELECT path,name,ext,size,mtime,body FROM files WHERE {clauses} LIMIT 2000", args).fetchall()
+        ranked = []
+        for row in rows:
+            path, name, ext, size, mtime, body = row
+            filename = search_fold(name); full_path = search_fold(path); content = search_fold(body)
+            score = sum((5 if term in filename else 0) + (2 if term in full_path else 0) + (1 if term in content else 0) for term in terms)
+            if score: ranked.append((score, mtime, row))
+        ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [item[2] for item in ranked[:limit]]
 
     def counts(self):
         with self.lock:
@@ -281,7 +427,22 @@ def local_model_names(provider: str, endpoint: str):
 
 def local_chat(provider: str, endpoint: str, model: str, messages: list[dict], timeout=180):
     path = "/api/chat" if provider == "Ollama" else "/chat/completions"
-    payload = {"model": model, "messages": messages, "stream": False}
+    prepared = []
+    for message in messages:
+        item = {key: value for key, value in message.items() if key != "_image_paths"}
+        image_paths = message.get("_image_paths", [])
+        if image_paths:
+            if provider == "Ollama":
+                item["images"] = [base64.b64encode(Path(image_path).read_bytes()).decode("ascii") for image_path in image_paths]
+            else:
+                parts = [{"type": "text", "text": str(item.get("content", ""))}]
+                for image_path in image_paths:
+                    mime = "image/jpeg" if Path(image_path).suffix.lower() in {".jpg", ".jpeg"} else "image/" + Path(image_path).suffix.lower().lstrip(".")
+                    encoded = base64.b64encode(Path(image_path).read_bytes()).decode("ascii")
+                    parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}})
+                item["content"] = parts
+        prepared.append(item)
+    payload = {"model": model, "messages": prepared, "stream": False}
     req = urllib.request.Request(_local_url(endpoint, path), data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r: result = json.loads(r.read())
     return result.get("message", {}).get("content") if provider == "Ollama" else result["choices"][0]["message"]["content"]
@@ -312,6 +473,10 @@ def human_size(size):
         value /= 1024
 
 
+def search_fold(value):
+    return str(value or "").casefold().replace("ё", "е")
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -324,6 +489,7 @@ class App(tk.Tk):
         self.chat_history = []; self.chat_attachments = []; self.chat_window = None; self.chat_busy = False
         self.chat_mode_var = tk.StringVar(value="Обычный чат"); self.goal_var = tk.StringVar(value="")
         self.chat_edit_path = None
+        self.project_file_path = None
         self.chat_working_dir = self.config_data.get("chat_working_dir", "")
         if self.chat_working_dir and not Path(self.chat_working_dir).is_dir(): self.chat_working_dir = ""
         self.last_assistant_answer = ""
@@ -455,7 +621,7 @@ class App(tk.Tk):
         target = Path(row[0]).with_name(name)
         if target.exists(): messagebox.showerror(APP_NAME, "Файл с таким именем уже существует."); return
         try: Path(row[0]).rename(target); self.index.relocate(Path(row[0]), target); self._refresh_results()
-        except (OSError, UnicodeError, zipfile.BadZipFile, ET.ParseError) as e: messagebox.showerror(APP_NAME, str(e))
+        except (OSError, UnicodeError, ValueError, zipfile.BadZipFile, ET.ParseError) as e: messagebox.showerror(APP_NAME, str(e))
     def move_selected(self):
         row = self.selected()
         if not row: return
@@ -570,12 +736,14 @@ class App(tk.Tk):
         chat = next((item for item in self.chats if item.get("id") == chat_id), None)
         if not chat: return
         self.active_chat_id = chat_id; self.chat_history = list(chat.get("history", []))
-        self.chat_attachments = list(chat.get("attachments", [])); self.chat_mode_var.set(chat.get("mode", "Обычный чат"))
+        self.chat_attachments = list(chat.get("attachments", [])); saved_mode = chat.get("mode", "Обычный чат")
+        self.chat_mode_var.set("Режим Cursor" if saved_mode == "Код проекта" else saved_mode)
         self.goal_var.set(chat.get("goal", "")); self.last_assistant_answer = chat.get("last_answer", "")
         saved_dir = chat.get("working_dir", self.config_data.get("chat_working_dir", ""))
         self.chat_working_dir = saved_dir if saved_dir and Path(saved_dir).is_dir() else ""
         self.chat_folder_label.set(self.chat_working_dir or "Рабочая папка не выбрана")
         self.chat_edit_path = next((Path(item["path"]) for item in reversed(self.chat_attachments) if item.get("path") and Path(item["path"]).is_file()), None)
+        self.project_file_path = self.chat_edit_path if self.chat_mode_var.get() == "Режим Cursor" else None
         self.chat_save_button.configure(state="normal" if self.last_assistant_answer else "disabled")
         self._refresh_chat_list(chat_id); self._update_attachment_label(); self._update_chat_mode_ui(); self._render_chat()
 
@@ -590,11 +758,20 @@ class App(tk.Tk):
     def _update_chat_mode_ui(self):
         if self.chat_mode_var.get() == "Работа по цели": self.goal_bar.grid(row=2, column=0, sticky="ew")
         else: self.goal_bar.grid_remove()
-        if self.chat_mode_var.get() == "Код проекта":
+        if self.chat_mode_var.get() == "Режим Cursor":
             if not self.project_panel.winfo_manager(): self.chat_body.insert(0, self.project_panel, weight=1)
+            if not self.editor_panel.winfo_manager(): self.chat_body.insert(1, self.editor_panel, weight=3)
             if self.chat_working_dir: self.refresh_project_files()
-        elif self.project_panel.winfo_manager():
-            self.chat_body.forget(self.project_panel)
+            active_path = getattr(self, "project_file_path", None)
+            if active_path and active_path.is_file():
+                for iid, candidate in self.project_paths.items():
+                    if candidate == active_path:
+                        self.project_tree.selection_set(iid); self.project_tree.see(iid); self._preview_project_file(active_path); break
+        else:
+            for panel in (self.project_panel, self.editor_panel):
+                if panel.winfo_manager(): self.chat_body.forget(panel)
+            self.project_editor.configure(state="normal"); self.project_editor.delete("1.0", "end"); self.project_editor.configure(state="disabled")
+            self.project_file_label.set("Выберите файл проекта")
 
     def _refresh_chat_list_entry(self):
         self._refresh_chat_list(self.active_chat_id)
@@ -604,13 +781,11 @@ class App(tk.Tk):
         base = Path(self.chat_working_dir) if self.chat_working_dir else None
         if not base or not base.is_dir(): return
         ignored = {".git", ".venv", "venv", "node_modules", "__pycache__", "dist", "build", "target", ".idea"}
-        editable_exts = EDITABLE_TEXT | {".docx"}
         index = 0
         for root, dirs, files in os.walk(base):
             dirs[:] = sorted(d for d in dirs if d not in ignored)
             for filename in sorted(files):
                 path = Path(root) / filename
-                if path.suffix.lower() not in editable_exts: continue
                 try:
                     st = path.stat()
                     if st.st_size > 50_000_000: continue
@@ -624,7 +799,40 @@ class App(tk.Tk):
         selection = self.project_tree.selection()
         if not selection: messagebox.showinfo(APP_NAME, "Выберите файл проекта."); return
         path = self.project_paths.get(selection[0])
-        if path: self._attach_path(path)
+        if path:
+            self.project_file_path = path; self.chat_edit_path = path
+            self._preview_project_file(path)
+            self._attach_path(path)
+
+    def _preview_selected_project_file(self, _event=None):
+        selection = self.project_tree.selection()
+        if not selection: return
+        path = self.project_paths.get(selection[0])
+        if path:
+            self.project_file_path = path
+            self._preview_project_file(path)
+
+    def _preview_project_file(self, path: Path):
+        self.project_file_label.set(str(path))
+        try:
+            if path.suffix.lower() in IMAGE_EXTS:
+                text = "Изображение. Прикрепите его к чату и выберите локальную vision-модель для анализа."
+            elif path.suffix.lower() in {".xlsx", ".xlsm", ".xls", ".xlsb"}:
+                text = excel_workbook_text(path, 100000)
+            elif path.suffix.lower() == ".docx":
+                text = extract_text(path)
+            elif path.suffix.lower() in SUPPORTED:
+                text = extract_text(path)
+            elif path.suffix.lower() not in EDITABLE_TEXT and not is_plain_text_file(path):
+                text = "Бинарный файл. Для этого формата нет текстового предпросмотра."
+            else:
+                text, _encoding = read_editable_text(path)
+                text = text[:200000]
+        except (OSError, UnicodeError, ImportError, ValueError, zipfile.BadZipFile) as e:
+            text = f"Не удалось открыть предпросмотр: {e}"
+        self.project_editor.configure(state="normal"); self.project_editor.delete("1.0", "end")
+        self.project_editor.insert("1.0", text or "(Файл пуст)")
+        self.project_editor.configure(state="disabled")
 
     def _build_chat_ui(self, win):
         self.chat_window = win
@@ -642,7 +850,7 @@ class App(tk.Tk):
         self.chat_listbox.configure(yscrollcommand=chat_scroll.set)
         head = ttk.Frame(main, padding=8); head.grid(row=0, column=0, sticky="ew"); head.columnconfigure(1, weight=1)
         ttk.Label(head, text="Режим:").grid(row=0, column=0)
-        self.chat_mode_box = ttk.Combobox(head, textvariable=self.chat_mode_var, values=["Обычный чат", "Работа по цели", "Код проекта"], state="readonly", width=18)
+        self.chat_mode_box = ttk.Combobox(head, textvariable=self.chat_mode_var, values=["Обычный чат", "Работа по цели", "Режим Cursor"], state="readonly", width=18)
         self.chat_mode_box.grid(row=0, column=1, sticky="w", padx=6); self.chat_mode_box.bind("<<ComboboxSelected>>", self._mode_changed)
         ttk.Label(head, text="Модель:").grid(row=0, column=2)
         self.chat_model_box = ttk.Combobox(head, textvariable=self.model, values=self.model_box.cget("values"), width=20)
@@ -665,12 +873,21 @@ class App(tk.Tk):
         self.project_tree = ttk.Treeview(self.project_panel, columns=("size",), show="tree headings", selectmode="browse")
         self.project_tree.heading("#0", text="Путь"); self.project_tree.heading("size", text="Размер")
         self.project_tree.column("#0", width=230); self.project_tree.column("size", width=70)
-        self.project_tree.grid(row=1, column=0, sticky="nsew"); self.project_tree.bind("<Double-1>", lambda _e: self.attach_project_file())
+        self.project_tree.grid(row=1, column=0, sticky="nsew"); self.project_tree.bind("<<TreeviewSelect>>", self._preview_selected_project_file); self.project_tree.bind("<Double-1>", lambda _e: self.attach_project_file())
         project_scroll = ttk.Scrollbar(self.project_panel, orient="vertical", command=self.project_tree.yview); project_scroll.grid(row=1, column=1, sticky="ns")
         self.project_tree.configure(yscrollcommand=project_scroll.set)
         tree_actions = ttk.Frame(self.project_panel); tree_actions.grid(row=2, column=0, sticky="ew", pady=4)
         ttk.Button(tree_actions, text="Обновить", command=self.refresh_project_files).pack(side="left", padx=2)
         ttk.Button(tree_actions, text="Прикрепить выбранный", command=self.attach_project_file).pack(side="left", padx=2)
+        self.editor_panel = ttk.Frame(body, padding=6); self.editor_panel.columnconfigure(0, weight=1); self.editor_panel.rowconfigure(1, weight=1)
+        self.project_file_label = tk.StringVar(value="Выберите файл проекта")
+        ttk.Label(self.editor_panel, textvariable=self.project_file_label, style="Title.TLabel").grid(row=0, column=0, sticky="ew", pady=(0, 5))
+        self.project_editor = tk.Text(self.editor_panel, wrap="none", state="disabled", font=("Cascadia Code", 10), background="#ffffff", foreground="#1f2937", insertbackground="#4f46e5", borderwidth=0, highlightthickness=1, highlightbackground="#d7ddea")
+        self.project_editor.grid(row=1, column=0, sticky="nsew")
+        editor_scroll = ttk.Scrollbar(self.editor_panel, orient="vertical", command=self.project_editor.yview); editor_scroll.grid(row=1, column=1, sticky="ns"); self.project_editor.configure(yscrollcommand=editor_scroll.set)
+        editor_actions = ttk.Frame(self.editor_panel); editor_actions.grid(row=2, column=0, sticky="ew", pady=4)
+        ttk.Button(editor_actions, text="Открыть в приложении", command=self.open_project_file).pack(side="left", padx=2)
+        ttk.Button(editor_actions, text="Задача с файлом → diff", command=self.prepare_edit, style="Accent.TButton").pack(side="right", padx=2)
         transcript = ttk.Frame(body); transcript.columnconfigure(0, weight=1); transcript.rowconfigure(0, weight=1)
         body.add(transcript, weight=4); self.chat_body = body
         self.chat_display = tk.Text(transcript, wrap="word", state="disabled", font=("Segoe UI", 11), padx=20, pady=16, background="#ffffff", foreground="#1f2937", insertbackground="#4f46e5", selectbackground="#c7d2fe", borderwidth=0, highlightthickness=0)
@@ -690,7 +907,7 @@ class App(tk.Tk):
         self.chat_input.grid(row=1, column=0, sticky="ew", pady=6); self.chat_input.bind("<Return>", self._chat_enter)
         controls = ttk.Frame(foot); controls.grid(row=1, column=1, sticky="se", padx=4)
         self.chat_send_button = ttk.Button(controls, text="Отправить", command=self.send_chat, style="Accent.TButton"); self.chat_send_button.pack(fill="x", pady=2)
-        self.chat_edit_button = ttk.Button(controls, text="Подготовить правку", command=self.prepare_edit); self.chat_edit_button.pack(fill="x", pady=2)
+        self.chat_edit_button = ttk.Button(controls, text="Выполнить задачу с файлом", command=self.prepare_edit); self.chat_edit_button.pack(fill="x", pady=2)
         self.chat_save_button = ttk.Button(controls, text="Сохранить ответ как файл…", command=self.save_chat_answer, state="disabled"); self.chat_save_button.pack(fill="x", pady=2)
         ttk.Label(foot, text="Enter — отправить · Shift+Enter — новая строка · Файлы передаются локальной модели, сохранение ответа выполняется вами.").grid(row=2, column=0, columnspan=2, sticky="w")
         self._refresh_chat_list()
@@ -710,7 +927,7 @@ class App(tk.Tk):
         self.chat_display.configure(state="normal"); self.chat_display.delete("1.0", "end")
         if not self.chat_history:
             mode_hint = {"Работа по цели": "Опишите цель в поле выше — чат сохранит её и будет помогать двигаться к результату по шагам.",
-                         "Код проекта": "Выберите рабочую папку проекта. Прикрепляйте файлы из дерева слева, задавайте вопросы и просите подготовить правку.",
+                         "Режим Cursor": "Выберите рабочую папку проекта. Откройте файл в дереве, смотрите код и задавайте задачу. Изменения появятся в diff и применятся только после подтверждения.",
                          "Обычный чат": "Задавайте вопросы и прикрепляйте файлы из рабочей папки."}.get(self.chat_mode_var.get(), "Задавайте вопросы.")
             self.chat_display.insert("end", f"Локальный чат\n\n{mode_hint}\n\nМодель не имеет доступа к файловой системе и не может удалять файлы.", "system")
         for item in self.chat_history:
@@ -734,10 +951,11 @@ class App(tk.Tk):
         folder = filedialog.askdirectory(title="Выберите рабочую папку чата", initialdir=initial)
         if folder:
             self.chat_working_dir = str(Path(folder).resolve())
+            self.project_file_path = None
             self.config_data["chat_working_dir"] = self.chat_working_dir; write_config(self.config_data)
             self.chat_folder_label.set(self.chat_working_dir)
             self._save_current_chat()
-            if self.chat_mode_var.get() == "Код проекта": self.refresh_project_files()
+            if self.chat_mode_var.get() == "Режим Cursor": self.refresh_project_files()
 
     def open_chat_working_dir(self):
         if not self.chat_working_dir or not Path(self.chat_working_dir).is_dir():
@@ -745,11 +963,20 @@ class App(tk.Tk):
         try: os.startfile(self.chat_working_dir)
         except (AttributeError, OSError) as e: messagebox.showerror(APP_NAME, str(e))
 
+    def open_project_file(self):
+        path = getattr(self, "project_file_path", None)
+        if not path or not path.is_file():
+            messagebox.showinfo(APP_NAME, "Сначала выберите файл проекта в дереве."); return
+        if path.suffix.lower() in {".exe", ".com", ".bat", ".cmd", ".msi", ".scr"}:
+            messagebox.showinfo(APP_NAME, "Запуск исполняемых файлов из предпросмотра отключён."); return
+        try: os.startfile(str(path))
+        except (AttributeError, OSError) as e: messagebox.showerror(APP_NAME, str(e))
+
     def attach_chat_file(self):
         if self.chat_busy: return
         initial = self.chat_working_dir if Path(self.chat_working_dir).is_dir() else str(Path.home())
-        chosen = filedialog.askopenfilenames(title="Прикрепите текстовые или офисные файлы", initialdir=initial,
-            filetypes=[("Все поддерживаемые", "*.txt *.md *.csv *.json *.py *.docx *.xlsx *.xlsm *.xlsb *.xls *.pptx *.odt *.ods *.odp *.pdf"),
+        chosen = filedialog.askopenfilenames(title="Прикрепите файлы к чату", initialdir=initial,
+            filetypes=[("Документы и изображения", "*.txt *.md *.csv *.json *.py *.docx *.xlsx *.xlsm *.xlsb *.xls *.pptx *.odt *.ods *.odp *.pdf *.png *.jpg *.jpeg *.webp *.bmp"),
                        ("Книги Excel", "*.xlsx *.xlsm *.xlsb *.xls"), ("Документы Word", "*.docx"), ("Все файлы", "*.*")])
         if not chosen: return
         skipped = []
@@ -764,23 +991,28 @@ class App(tk.Tk):
         if len(self.chat_attachments) >= 8: return False, "лимит 8 файлов"
         if any(item.get("path") == str(path) for item in self.chat_attachments):
             self.chat_edit_path = path; return True, ""
-        if path.suffix.lower() not in SUPPORTED: return False, "формат не поддерживается"
-        if self.chat_mode_var.get() == "Код проекта":
+        ext = path.suffix.lower(); is_image = ext in IMAGE_EXTS
+        generic_text = ext not in SUPPORTED and is_plain_text_file(path)
+        if path.suffix.lower() not in SUPPORTED and not generic_text: return False, "для этого бинарного формата пока нет локального парсера"
+        if self.chat_mode_var.get() == "Режим Cursor":
             if not self.chat_working_dir: return False, "сначала задайте рабочую папку проекта"
             try: path.relative_to(Path(self.chat_working_dir).resolve())
             except ValueError: return False, "в режиме кода разрешены только файлы из рабочей папки"
         try:
             if path.stat().st_size > 50_000_000: return False, "больше 50 МБ"
-            text = extract_text(path)
-        except OSError: return False, "не удалось прочитать файл"
-        if text.startswith("[Для чтения "):
+            if is_image and path.stat().st_size > 20_000_000: return False, "изображение больше 20 МБ"
+            text = (f"Изображение {path.name}; будет передано локальной модели с поддержкой зрения." if is_image else
+                    read_editable_text(path)[0][:80000] if generic_text else
+                    excel_workbook_text(path, 80000) if path.suffix.lower() in {".xlsx", ".xlsm", ".xls", ".xlsb"} else extract_text(path))
+        except (OSError, UnicodeError): return False, "не удалось прочитать файл"
+        if text.startswith("[Для "):
             return False, text[1:-1]
-        if not text or text.startswith("[Для извлечения текста из PDF"):
+        if (not text and ext not in EDITABLE_TEXT and not generic_text) or text.startswith("[Для извлечения текста из PDF"):
             return False, "текст не извлечён"
         remaining = 80000 - sum(len(item["text"]) for item in self.chat_attachments)
         if remaining <= 0: return False, "общий лимит контекста 80 000 символов"
         attached = text[:remaining]
-        self.chat_attachments.append({"name": path.name, "path": str(path), "text": attached, "truncated": len(attached) < len(text)})
+        self.chat_attachments.append({"name": path.name, "path": str(path), "text": attached, "image": is_image, "truncated": len(attached) < len(text)})
         self.chat_edit_path = path; self._update_attachment_label(); self._save_current_chat()
         return True, ""
 
@@ -795,25 +1027,71 @@ class App(tk.Tk):
 
     def _chat_messages(self):
         system = "Ты помощник в локальном файловом менеджере. Отвечай на языке пользователя. У тебя нет инструментов и доступа к диску: ты не можешь перемещать, создавать или удалять файлы. Для правки верни полный текст изменённого файла по явному запросу пользователя; приложение покажет его и попросит подтверждение."
+        if any(item.get("image") for item in self.chat_attachments):
+            system += "\nК беседе приложено изображение. Если выбранная модель не умеет анализировать изображения, прямо сообщи об этом пользователю."
         if self.chat_mode_var.get() == "Работа по цели":
             goal = self.goal_var.get().strip()
             system += "\nРежим работы по цели: помогай последовательно достигать явно указанной цели, предлагай следующий конкретный шаг и учитывай предыдущие сообщения."
             if goal: system += "\nЦель пользователя: " + goal
-        elif self.chat_mode_var.get() == "Код проекта":
-            system += "\nРежим кода проекта: анализируй только явно приложенные файлы. Помогай с кодом и предлагай точные правки. Рабочая папка не означает автоматический доступ к другим файлам проекта."
+        elif self.chat_mode_var.get() == "Режим Cursor":
+            system += "\nРежим Cursor: анализируй только открытый в редакторе файл и явно приложенные файлы. Помогай с кодом и предлагай точные правки. Рабочая папка не означает автоматический доступ к остальным файлам проекта."
             if self.chat_working_dir: system += "\nРабочий проект: " + Path(self.chat_working_dir).name
+            active_path = getattr(self, "project_file_path", None)
+            if active_path and active_path.is_file() and not any(item.get("path") == str(active_path) for item in self.chat_attachments):
+                try:
+                    active_text = ("Selected image: " + active_path.name if active_path.suffix.lower() in IMAGE_EXTS else
+                                   excel_workbook_text(active_path, 50000) if active_path.suffix.lower() in {".xlsx", ".xlsm", ".xls", ".xlsb"}
+                                   else extract_text(active_path) if active_path.suffix.lower() in SUPPORTED
+                                   else read_editable_text(active_path)[0][:50000] if is_plain_text_file(active_path)
+                                   else "Binary file selected; no local content adapter is available.")
+                    system += f"\n\n--- Открытый файл проекта: {active_path.name} ---\n{active_text}"
+                except (OSError, UnicodeError, ValueError, ImportError, zipfile.BadZipFile): pass
         if self.chat_attachments:
             system += "\n\nПользователь передал содержимое файлов только для этой беседы. Рабочая папка чата: " + (Path(self.chat_working_dir).name if self.chat_working_dir else "не выбрана")
             for item in self.chat_attachments:
                 system += f"\n\n--- Вложение: {item['name']} ---\n{item['text']}"
-        return [{"role": "system", "content": system}] + self.chat_history
+        messages = [{"role": "system", "content": system}] + self.chat_history
+        image_paths = [item["path"] for item in self.chat_attachments if item.get("image") and Path(item.get("path", "")).is_file()]
+        active_path = getattr(self, "project_file_path", None)
+        if self.chat_mode_var.get() == "Режим Cursor" and active_path and active_path.suffix.lower() in IMAGE_EXTS and active_path.is_file():
+            if str(active_path) not in image_paths: image_paths.append(str(active_path))
+        if image_paths:
+            for message in reversed(messages):
+                if message.get("role") == "user":
+                    message["_image_paths"] = image_paths; break
+        return messages
 
     def send_chat(self):
         if self.chat_busy: return
         prompt = self.chat_input.get("1.0", "end-1c").strip()
         if not prompt: return
+        edit_words = re.search(r"\b(измени|изменить|исправь|исправить|добавь|добавить|заполни|заполнить|замени|заменить|перепиши|переписать|отредактируй|отредактировать|переведи|перевести|сократи|сократить|обнови|обновить|change|edit|update|rewrite|fill|translate|format)\b", prompt, re.IGNORECASE)
+        active_path = (getattr(self, "project_file_path", None) if self.chat_mode_var.get() == "Режим Cursor" else None)
+        candidate = active_path or self.chat_edit_path
+        if not candidate:
+            row = self.selected(); candidate = Path(row[0]) if row else None
+        if edit_words and candidate and candidate.is_file():
+            ext = candidate.suffix.lower()
+            if ext in EDITABLE_TEXT | {".docx", ".xlsx", ".xlsm", ".xls", ".xlsb"} or (ext not in SUPPORTED and is_plain_text_file(candidate)):
+                self.prepare_edit(); return
         self.chat_input.delete("1.0", "end"); self.chat_history.append({"role": "user", "content": prompt}); self._render_chat()
         self._save_current_chat()
+        search_terms = extract_file_search_query(prompt)
+        if search_terms is not None:
+            results = self.index.find_relevant(search_terms)
+            if results:
+                lines = [f"Нашёл файлы в проиндексированных папках ({len(results)}):"]
+                for path, name, ext, size, _mtime, _body in results:
+                    lines.append(f"• {name} ({ext or 'без расширения'}, {human_size(size)})\n  {path}")
+                answer = "\n".join(lines)
+            else:
+                answer = ("По этому запросу совпадений в локальном индексе нет. Поиск охватывает папки, добавленные во вкладке «Файлы и поиск» и просканированные кнопкой «Сканировать». "
+                          "Добавьте нужный диск или папку и запустите сканирование, затем повторите запрос.")
+            self.last_assistant_answer = answer
+            if self.chat_window and self.chat_window.winfo_exists(): self.chat_save_button.configure(state="normal")
+            self.chat_history.append({"role": "assistant", "content": answer}); self._render_chat(); self._save_current_chat()
+            self.status.set("Поиск по локальному индексу завершён")
+            return
         self._run_chat(self._chat_messages(), purpose="chat")
 
     def save_chat_answer(self):
@@ -835,14 +1113,22 @@ class App(tk.Tk):
     def prepare_edit(self):
         if self.chat_busy: return
         row = self.selected()
-        if not row and not (self.chat_edit_path and self.chat_edit_path.is_file()):
+        active_project_path = getattr(self, "project_file_path", None)
+        if not row and not (self.chat_edit_path and self.chat_edit_path.is_file()) and not (self.chat_mode_var.get() == "Режим Cursor" and active_project_path and active_project_path.is_file()):
             messagebox.showinfo(APP_NAME, "Выберите файл в списке, затем попросите изменить его."); return
-        path = (self.chat_edit_path if self.chat_edit_path and self.chat_edit_path.is_file() else Path(row[0] if row else "")); ext = path.suffix.lower()
-        edit_kind = "docx" if ext == ".docx" else "text"
-        if ext not in EDITABLE_TEXT and edit_kind != "docx":
-            messagebox.showinfo(APP_NAME, "Правки поддерживаются для текста, исходного кода и Word DOCX. Для других Office-файлов доступен чат по содержимому, без перезаписи книги или презентации."); return
+        if self.chat_mode_var.get() == "Режим Cursor" and active_project_path and active_project_path.is_file(): path = active_project_path
+        else: path = self.chat_edit_path if self.chat_edit_path and self.chat_edit_path.is_file() else Path(row[0] if row else "")
+        ext = path.suffix.lower()
+        excel_exts = {".xlsx", ".xlsm", ".xls", ".xlsb"}
+        edit_kind = "excel" if ext in excel_exts else ("docx" if ext == ".docx" else "text")
+        generic_text = ext not in SUPPORTED and is_plain_text_file(path)
+        if ext not in EDITABLE_TEXT and edit_kind not in {"docx", "excel"} and not generic_text:
+            messagebox.showinfo(APP_NAME, "Правки поддерживаются для текста, исходного кода, DOCX и книг Excel. Для других Office-файлов пока доступен чат по содержимому."); return
         try:
-            if edit_kind == "docx":
+            if edit_kind == "excel":
+                original = excel_workbook_text(path, 80000)
+                if not original.strip(): messagebox.showinfo(APP_NAME, "В книге не найдены значения ячеек для передачи модели."); return
+            elif edit_kind == "docx":
                 original = docx_paragraphs(path)
                 if not original: messagebox.showinfo(APP_NAME, "В документе не найдено текстовых абзацев."); return
                 if len(original) > 120 or sum(len(p["text"]) for p in original) > 30000:
@@ -850,12 +1136,20 @@ class App(tk.Tk):
             else:
                 original, edit_encoding = read_editable_text(path)
                 if len(original) > 50000: messagebox.showinfo(APP_NAME, "Для правки выберите текстовый файл не длиннее 50 000 символов."); return
-        except (OSError, UnicodeError, zipfile.BadZipFile, ET.ParseError) as e:
+        except (OSError, UnicodeError, ValueError, zipfile.BadZipFile, ET.ParseError, ImportError) as e:
             messagebox.showerror(APP_NAME, f"Не удалось прочитать файл: {e}"); return
         request = self.chat_input.get("1.0", "end-1c").strip()
         if not request:
             messagebox.showinfo(APP_NAME, "Напишите, что нужно изменить, в поле сообщения."); return
-        if edit_kind == "docx":
+        if edit_kind == "excel":
+            instruction = ("Выполни задачу с данными книги Excel. Верни только JSON вида "
+                           '{"operations":[{"sheet":"Имя листа","cell":"B2","value":"новое значение"}]}. '
+                           "Разрешены только точечные записи новых значений в существующие ячейки существующих листов. "
+                           "Не возвращай null, не удаляй и не очищай значения, не добавляй/удаляй листы, строки или столбцы. "
+                           "Сохраняй все остальные ячейки без изменений. Значение может быть текстом, числом или формулой Excel. "
+                           "Если просьбу нельзя выполнить такими операциями, верни пустой список operations.\n\n"
+                           f"Файл: {path.name}\nЗадача пользователя: {request}\nСодержимое книги с адресами ячеек:\n{original}")
+        elif edit_kind == "docx":
             original_text = json.dumps([{"id": p["id"], "text": p["text"]} for p in original], ensure_ascii=False, indent=2)
             instruction = ("Измени только те абзацы Word, которые нужны для выполнения просьбы. Верни только JSON вида "
                            "{\"changes\":[{\"id\":1,\"text\":\"полный новый текст абзаца\"}]}. "
@@ -866,8 +1160,9 @@ class App(tk.Tk):
                            "Сохрани все части, которые не просили менять.\n\n"
                            f"Файл: {path.name}\nПросьба: {request}\nИсходный текст:\n{original}")
         self.chat_input.delete("1.0", "end")
-        self.chat_history.append({"role": "user", "content": f"Подготовить правку `{path.name}`: {request}"}); self._render_chat()
-        self._run_chat([{"role": "system", "content": "Ты редактируешь только переданный текст. Не управляешь файловой системой. Выполняй только просьбу пользователя."}, {"role": "user", "content": instruction}], purpose="edit", edit_path=path, original=original, edit_kind=edit_kind, edit_encoding=locals().get("edit_encoding", "utf-8"))
+        self.chat_history.append({"role": "user", "content": f"Выполнить задачу с файлом `{path.name}`: {request}"}); self._render_chat()
+        system = "Ты выполняешь запрос только на переданных данных. У тебя нет доступа к файловой системе и инструментов удаления. Не придумывай действия вне описанной схемы."
+        self._run_chat([{"role": "system", "content": system}, {"role": "user", "content": instruction}], purpose="edit", edit_path=path, original=original, edit_kind=edit_kind, edit_encoding=locals().get("edit_encoding", "utf-8"))
 
     def _run_chat(self, messages, purpose, edit_path=None, original=None, edit_kind="text", edit_encoding="utf-8"):
         self.chat_busy = True; self.chat_send_button.configure(state="disabled"); self.chat_edit_button.configure(state="disabled")
@@ -889,7 +1184,13 @@ class App(tk.Tk):
             self.chat_send_button.configure(state="normal"); self.chat_edit_button.configure(state="normal")
         self.status.set("Ответ получен от локальной модели")
         if purpose == "edit":
-            if edit_kind == "docx":
+            if edit_kind == "excel":
+                try:
+                    plan = extract_json_object(answer)
+                    edited = validate_excel_operations(edit_path, plan)
+                except (ValueError, TypeError, KeyError, json.JSONDecodeError, ImportError, OSError) as e:
+                    self._chat_error(f"Не удалось подготовить изменения Excel: {e}"); return
+            elif edit_kind == "docx":
                 try:
                     plan = extract_json_object(answer)
                     by_id = {p["id"]: p for p in original}; changes = []
@@ -912,7 +1213,7 @@ class App(tk.Tk):
                     edited = edited.split("\n", 1)[1].rsplit("```", 1)[0].rstrip()
                 if not edited: self._chat_error("Модель вернула пустой документ."); return
                 if len(edited) > 75000: self._chat_error("Ответ модели длиннее безопасного лимита для правки (75 000 символов)."); return
-            self.chat_history.append({"role": "assistant", "content": "Подготовлены правки для проверки. Исходный файл пока не изменён."}); self._render_chat()
+            self.chat_history.append({"role": "assistant", "content": "Подготовлены изменения файла для проверки. Исходник пока не менялся."}); self._render_chat()
             self._save_current_chat()
             self._show_edit_preview(edit_path, original, edited, edit_kind, edit_encoding)
         else:
@@ -932,7 +1233,12 @@ class App(tk.Tk):
         win = tk.Toplevel(self); win.title(f"Проверка правок — {path.name}"); win.geometry("1000x680"); win.columnconfigure(0, weight=1); win.rowconfigure(1, weight=1)
         ttk.Label(win, text="Проверьте каждую правку. Исходник пока не менялся; резервная копия создаётся только при замене.", padding=8).grid(row=0, column=0, sticky="w")
         diff = tk.Text(win, wrap="none", font=("Consolas", 10)); diff.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
-        if edit_kind == "docx":
+        if edit_kind == "excel":
+            lines = ["Изменения ячеек (файл не менялся):"]
+            for change in edited:
+                lines.append(f"{change['sheet']}!{change['cell']}: {change['old']!r}  →  {change['value']!r}")
+            diff.insert("1.0", "\n".join(lines))
+        elif edit_kind == "docx":
             preview = []
             for change in edited:
                 preview.extend(difflib.unified_diff([change["text"] + "\n"], [change["new_text"] + "\n"], fromfile=f"абзац {change['id']} — исходник", tofile=f"абзац {change['id']} — правка"))
@@ -942,17 +1248,23 @@ class App(tk.Tk):
         diff.configure(state="disabled")
         buttons = ttk.Frame(win, padding=8); buttons.grid(row=2, column=0, sticky="e")
         ttk.Button(buttons, text="Сохранить как копию", command=lambda: self._save_edit_copy(path, edited, win, edit_kind, edit_encoding)).pack(side="left", padx=4)
-        ttk.Button(buttons, text="Заменить исходник с backup", command=lambda: self._replace_with_backup(path, edited, win, edit_kind, edit_encoding)).pack(side="left", padx=4)
+        if edit_kind != "excel" or path.suffix.lower() in {".xlsx", ".xlsm"}:
+            ttk.Button(buttons, text="Заменить исходник с backup", command=lambda: self._replace_with_backup(path, edited, win, edit_kind, edit_encoding)).pack(side="left", padx=4)
         ttk.Button(buttons, text="Отмена", command=win.destroy).pack(side="left", padx=4)
 
     def _save_edit_copy(self, path, edited, window, edit_kind, edit_encoding="utf-8"):
-        target = path.with_name(path.stem + "_edited" + path.suffix); number = 2
+        target_ext = ".xlsx" if edit_kind == "excel" and path.suffix.lower() in {".xls", ".xlsb"} else path.suffix
+        target = path.with_name(path.stem + "_edited" + target_ext); number = 2
         while target.exists():
-            target = path.with_name(f"{path.stem}_edited_{number}{path.suffix}"); number += 1
+            target = path.with_name(f"{path.stem}_edited_{number}{target_ext}"); number += 1
         try:
-            if edit_kind == "docx": write_docx_edits(path, target, edited)
+            if edit_kind == "excel": write_excel_operations(path, target, edited)
+            elif edit_kind == "docx": write_docx_edits(path, target, edited)
             else: target.write_bytes(edited.encode(edit_encoding))
-            self.index.refresh_path(target); messagebox.showinfo(APP_NAME, f"Копия сохранена:\n{target}"); window.destroy(); self._refresh_results()
+            self.index.refresh_path(target)
+            self.chat_history.append({"role": "assistant", "content": f"Готовый файл сохранён:\n{target}"})
+            self._render_chat(); self._save_current_chat()
+            messagebox.showinfo(APP_NAME, f"Готовый файл сохранён:\n{target}"); window.destroy(); self._refresh_results()
         except (OSError, UnicodeError, zipfile.BadZipFile, ET.ParseError) as e: messagebox.showerror(APP_NAME, str(e))
 
     def _replace_with_backup(self, path, edited, window, edit_kind, edit_encoding="utf-8"):
@@ -962,13 +1274,14 @@ class App(tk.Tk):
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         try:
             shutil.copy2(path, backup)
-            if edit_kind == "docx": write_docx_edits(path, temporary, edited)
+            if edit_kind == "excel": write_excel_operations(path, temporary, edited)
+            elif edit_kind == "docx": write_docx_edits(path, temporary, edited)
             else: temporary.write_bytes(edited.encode(edit_encoding))
             temporary.replace(path)
             self.index.refresh_path(path)
             messagebox.showinfo(APP_NAME, f"Изменения сохранены. Резервная копия:\n{backup}")
             window.destroy(); self._refresh_results()
-        except (OSError, UnicodeError, zipfile.BadZipFile, ET.ParseError) as e:
+        except (OSError, UnicodeError, ValueError, zipfile.BadZipFile, ET.ParseError) as e:
             messagebox.showerror(APP_NAME, f"Не удалось сохранить правки. Резервная копия (если создана):\n{backup}\n\n{e}")
     def _answer(self, answer):
         win = tk.Toplevel(self); win.title("Ответ локального ИИ"); win.geometry("720x520")
