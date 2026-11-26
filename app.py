@@ -542,6 +542,17 @@ def local_chat(models_dir: str | Path, model: str, messages: list[dict], timeout
         if marker_at >= 0: output = output[marker_at + len(input_marker):]
         if "\n[ Prompt:" in output: output = output.split("\n[ Prompt:", 1)[0]
         output = output.split("\nExiting...", 1)[0].strip()
+        if output.startswith("Loading model..."):
+            # llama.cpp can emit its interactive banner on stdout despite --simple-io.
+            # Keep only text after the prompt echo, if the runtime printed one.
+            marker_at = output.rfind("\n> ")
+            if marker_at >= 0:
+                output = output[marker_at + 1:].split("\n", 1)[-1].strip()
+            else:
+                output = re.sub(r"^Loading model\.\.\.\s*", "", output, count=1).strip()
+            output = re.sub(r"^(?:[▄█▀ ]+\n)+", "", output).strip()
+        if re.match(r"^Error:\s*request\s*\(\d+\s+tokens\)\s+exceeds\s+the\s+available\s+context", output, re.IGNORECASE):
+            raise RuntimeError("Локальная модель отклонила запрос по размеру контекста. Начните новый чат или уменьшите объём вложения.")
         if not output:
             log_event(f"LLM_REQUEST_EMPTY model={model!r} device={cuda_device}")
             raise RuntimeError("Локальная модель вернула пустой ответ.")
@@ -555,6 +566,7 @@ def compact_chat_messages(messages: list[dict], max_chars=90000):
     copied = [dict(message) for message in messages]
     system = next((item for item in copied if item.get("role") == "system"), {"role": "system", "content": ""})
     turns = [item for item in copied if item.get("role") != "system"]
+    turns = [item for item in turns if not _is_model_runtime_artifact(item)]
     original_chars = len(str(system.get("content", ""))) + sum(len(str(item.get("content", ""))) for item in turns)
     if not turns: raise ValueError("В запросе нет сообщения пользователя.")
     newest = turns[-1]
@@ -574,6 +586,14 @@ def compact_chat_messages(messages: list[dict], max_chars=90000):
     compacted = [system] + kept
     sent_chars = len(str(system.get("content", ""))) + sum(len(str(item.get("content", ""))) for item in kept)
     return compacted, original_chars, sent_chars
+
+
+def _is_model_runtime_artifact(message: dict) -> bool:
+    """Do not feed prior runtime errors or llama.cpp banners back as conversation turns."""
+    if message.get("role") != "assistant": return False
+    content = str(message.get("content", "")).lstrip()
+    return (content.startswith("Loading model...") or content.startswith("Ошибка локальной модели:") or
+            bool(re.match(r"^(?:Ошибка локальной модели:\s*)?Error:\s*request\s*\(\d+\s+tokens\)", content, re.IGNORECASE)))
 
 
 def install_inference_runtime() -> tuple[bool, str]:
@@ -2278,6 +2298,7 @@ class App(tk.Tk):
 
     def _chat_messages(self):
         system = "Ты помощник в локальном файловом менеджере. Отвечай на языке пользователя. У тебя нет инструментов и доступа к диску: ты не можешь перемещать, создавать или удалять файлы. Для правки верни полный текст изменённого файла по явному запросу пользователя; приложение покажет его и попросит подтверждение."
+        file_context = []
         if any(item.get("image") for item in self.chat_attachments):
             system += "\nК беседе приложено изображение. Если выбранная модель не умеет анализировать изображения, прямо сообщи об этом пользователю."
         if self.chat_mode_var.get() == "Работа по цели":
@@ -2305,7 +2326,7 @@ class App(tk.Tk):
                                    else extract_text(active_path) if active_path.suffix.lower() in SUPPORTED
                                    else read_editable_text(active_path)[0][:50000] if is_plain_text_file(active_path)
                                    else "Binary file selected; no local content adapter is available.")
-                    system += f"\n\n--- Открытый файл проекта: {active_path.name} ---\n{active_text}"
+                    file_context.append(f"--- Открытый файл проекта: {active_path.name} ---\n{active_text}")
                 except (OSError, UnicodeError, ValueError, ImportError, zipfile.BadZipFile): pass
         elif self.main_notebook.select() == str(self.files_tab):
             selected_row = self.selected()
@@ -2313,13 +2334,19 @@ class App(tk.Tk):
                 active_path = Path(selected_row[0])
                 try:
                     active_text = selected_row[5] or ("К сообщению прикреплено изображение; анализируй его, если модель поддерживает зрение." if active_path.suffix.lower() in IMAGE_EXTS else excel_workbook_text(active_path, 50000) if active_path.suffix.lower() in {".xlsx", ".xlsm", ".xls", ".xlsb"} else extract_text(active_path) if active_path.suffix.lower() in SUPPORTED else read_editable_text(active_path)[0][:50000] if is_plain_text_file(active_path) else "")
-                    if active_text: system += f"\n\nПользователь выбрал найденный локальный файл. Отвечай по его содержимому:\n--- {active_path.name} ---\n{active_text[:50000]}"
+                    if active_text: file_context.append(f"Пользователь выбрал найденный локальный файл. Отвечай по его содержимому:\n--- {active_path.name} ---\n{active_text[:50000]}")
                 except (OSError, UnicodeError, ValueError, ImportError, zipfile.BadZipFile): pass
         if self.chat_attachments:
-            system += "\n\nПользователь передал содержимое файлов только для этой беседы. Рабочая папка чата: " + (Path(self.chat_working_dir).name if self.chat_working_dir else "не выбрана")
+            file_context.append("Пользователь передал содержимое файлов только для этой беседы. Рабочая папка чата: " + (Path(self.chat_working_dir).name if self.chat_working_dir else "не выбрана"))
             for item in self.chat_attachments:
-                system += f"\n\n--- Вложение: {item['name']} ---\n{item['text']}"
-        messages = [{"role": "system", "content": system}] + self.chat_history
+                file_context.append(f"--- Вложение: {item['name']} ---\n{item['text']}")
+        # Document bodies are data for the current question, never system instructions.
+        # Copy history so attachment text is not permanently duplicated in saved chats.
+        messages = [{"role": "system", "content": system}] + [dict(item) for item in self.chat_history]
+        if file_context:
+            current_user = next((item for item in reversed(messages) if item.get("role") == "user"), None)
+            if current_user:
+                current_user["content"] = str(current_user.get("content", "")) + "\n\n" + "\n\n".join(file_context)
         image_paths = [item["path"] for item in self.chat_attachments if item.get("image") and Path(item.get("path", "")).is_file()]
         active_path = getattr(self, "project_file_path", None)
         if self.main_notebook.select() == str(self.files_tab):
