@@ -6,12 +6,12 @@ The user explicitly chooses the folders to index. The index is stored in `%APPDA
 
 ## Local model connection
 
-The app connects to a local Ollama service at `127.0.0.1:11434`. On startup it tries to connect and may launch the installed Ollama service without opening a console. File contents are sent only to that local model endpoint when the user asks for an AI operation.
+The app connects to a local Ollama service at `127.0.0.1:11434` or LM Studio's OpenAI-compatible API, usually `http://127.0.0.1:1234/v1`. On startup it tries Ollama and may launch the installed service without opening a console. File contents are sent only to the selected localhost model when the user asks for an AI operation.
 
 ## Organization and office files
 
-Organization suggestions do not modify files. The user selects a file and invokes a move or rename action separately. Office documents open through the Windows default application. DOCX, XLSX, PPTX and OpenDocument files are text-indexed from their local document containers.
+Organization suggestions do not modify files. The user selects a file and invokes a move or rename action separately. No delete operation exists, and the model has no file-system tools. Text and source-code edits show a diff first; replacing the source requires explicit confirmation and a timestamped backup. DOCX edits are limited to selected paragraph text and retain the rest of the Office package. XLSX, PPTX and OpenDocument files are indexed and opened in the installed office application; their structure is not rewritten.
 
 ## Checks
 
-After changing the app, verify syntax, run a small content-indexing smoke check, and launch through the desktop shortcut. When a local model is available, make one short generation request to confirm the connection.
+After changing the app, verify syntax and content search, then exercise chat and text/DOCX edit previews using temporary files. Launch through the desktop shortcut and confirm the local model returns a response. Review filesystem operations to ensure the model still has no way to delete files; do not use real user documents for smoke edits.
