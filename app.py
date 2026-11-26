@@ -40,8 +40,9 @@ APP_NAME = "Локальный файловый менеджер"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 SUPPORTED = {".txt", ".md", ".rst", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".py", ".js", ".ts", ".css", ".log", ".ini", ".yaml", ".yml", ".toml", ".rtf", ".docx", ".xlsx", ".xlsm", ".xls", ".xlsb", ".pptx", ".odt", ".ods", ".odp", ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".sql", ".sh", ".ps1", ".bat", ".cs", ".java", ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".jsx", ".tsx", ".vue", ".svelte", ".php", ".rb", ".swift", ".kt", ".properties", ".env"}
 MAX_TEXT = 500_000
-CUDA_RUNTIME_URL = "https://github.com/ggml-org/llama.cpp/releases/download/b12755/llama-b12755-bin-win-cuda-12.4-x64.zip"
-CUDA_RUNTIME_DIR = Path(os.environ.get("APPDATA", Path.home())) / "LocalFileManager" / "runtime" / "llama-cpp-b12755"
+CUDA_RUNTIME_VERSION = "b12780"
+CUDA_RUNTIME_URL = f"https://github.com/ggml-org/llama.cpp/releases/download/{CUDA_RUNTIME_VERSION}/llama-{CUDA_RUNTIME_VERSION}-bin-win-cuda-12.4-x64.zip"
+CUDA_RUNTIME_DIR = Path(os.environ.get("APPDATA", Path.home())) / "LocalFileManager" / "runtime" / f"llama-cpp-{CUDA_RUNTIME_VERSION}"
 _INFERENCE_LOCK = threading.RLock()
 _INFERENCE_STOP = threading.Event()
 _INFERENCE_PROCESS_LOCK = threading.Lock()
@@ -588,6 +589,13 @@ def local_chat(models_dir: str | Path, model: str, messages: list[dict], timeout
         if result.returncode:
             detail = (result.stderr or result.stdout)[-2000:]
             log_event(f"LLM_REQUEST_ERROR model={model!r} device={cuda_device} exit={result.returncode} detail={detail!r}")
+            if "qwen3vl.rope.dimension_sections" in detail:
+                raise RuntimeError(
+                    "Этот файл qwen3-vl взят из хранилища Ollama и использует его специальный GGUF-формат. "
+                    "Автономный llama.cpp не может загрузить этот вариант напрямую; обновление CUDA-runtime "
+                    "не исправляет несовместимые метаданные. Добавьте отдельный GGUF, подготовленный для llama.cpp, "
+                    "через «Добавить GGUF…». Исходный файл модели не изменён."
+                )
             raise RuntimeError(f"llama.cpp завершился с кодом {result.returncode}:\n{detail}")
         output = result.stdout
         input_marker = "\n> " + prompt + "\n"
@@ -683,7 +691,7 @@ def install_inference_runtime() -> tuple[bool, str]:
             if result.returncode: raise RuntimeError(f"Не удалось поставить CUDA runtime; см. {log_path}")
         if not archive.exists():
             with log_path.open("a", encoding="utf-8") as log:
-                log.write("\\nDownloading official llama.cpp b12755 CUDA 12.4 runtime\\n")
+                log.write(f"\nDownloading official llama.cpp {CUDA_RUNTIME_VERSION} CUDA 12.4 runtime\n")
             partial = archive.with_suffix(".part")
             with urllib.request.urlopen(CUDA_RUNTIME_URL, timeout=60) as response, partial.open("wb") as destination:
                 shutil.copyfileobj(response, destination)
