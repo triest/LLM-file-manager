@@ -517,9 +517,9 @@ def resolve_model_path(models_dir: str | Path, model: str) -> Path:
 
 
 def local_chat(models_dir: str | Path, model: str, messages: list[dict], timeout=180):
-    executable = runtime_executable()
+    executable = runtime_chat_executable()
     if not executable:
-        raise RuntimeError("Встроенный движок устанавливается автоматически. Подождите минуту и повторите запрос.")
+        raise RuntimeError("Встроенный движок диалоговых шаблонов устанавливается автоматически. Подождите минуту и повторите запрос.")
     model_path = resolve_model_path(models_dir, model)
     if any(message.get("_image_paths") for message in messages):
         raise ValueError("Для вложенных изображений выберите модель и формат, поддерживаемые встроенным GGUF-движком.")
@@ -532,11 +532,13 @@ def local_chat(models_dir: str | Path, model: str, messages: list[dict], timeout
         log_event(f"CUDA_DEVICE_ERROR model={model!r} exit={device_check.returncode} detail={detail!r}")
         raise RuntimeError("CUDA-видеокарта не обнаружена встроенным движком. Проверьте драйвер NVIDIA и журнал приложения.\n" + detail)
     cuda_device = cuda_match.group(1)
-    log_event(f"CUDA_DEVICE_SELECTED name={cuda_device} devices={device_check.stdout.strip()!r} gpu_layers=all context_tokens=65536 kv_cache=q4_0 rope_scaling=yarn scale=2 orig_ctx=32768")
+    log_event(f"CUDA_DEVICE_SELECTED name={cuda_device} devices={device_check.stdout.strip()!r} gpu_layers=all context_tokens=32768 kv_cache=q4_0")
     system = next((str(item.get("content", "")) for item in compacted_messages if item.get("role") == "system"), "Отвечай на языке пользователя.")
     turns = [item for item in compacted_messages if item.get("role") != "system"]
     prompt = "\n\n".join(("Пользователь" if item.get("role") == "user" else "Ассистент") + ":\n" + str(item.get("content", "")) for item in turns)
+    if len(turns) == 1 and turns[0].get("role") == "user": prompt = str(turns[0].get("content", ""))
     if not prompt: raise ValueError("В сообщении нет текста для модели.")
+    temperature = "0.6" if "deepseek-r1" in model.casefold() else "0.2"
     log_event(f"LLM_REQUEST_START model={model!r} model_path={str(model_path)!r} device={cuda_device} prompt_chars={len(prompt)} system_chars={len(system)} context_chars={original_chars}->{sent_chars}")
     started = time.monotonic()
     if _INFERENCE_STOP.is_set(): raise RuntimeError("CUDA-запрос отменён: приложение закрывается.")
@@ -547,10 +549,8 @@ def local_chat(models_dir: str | Path, model: str, messages: list[dict], timeout
             temp = Path(temp_dir); prompt_file = temp / "prompt.txt"; system_file = temp / "system.txt"
             prompt_file.write_text(prompt, encoding="utf-8"); system_file.write_text(system, encoding="utf-8")
             command = [str(executable), "-m", str(model_path), "-f", str(prompt_file), "--system-prompt-file", str(system_file),
-                       "-n", "2048", "-dev", cuda_device, "-ngl", "999", "-c", "65536",
-                       "--rope-scaling", "yarn", "--rope-scale", "2", "--yarn-orig-ctx", "32768",
-                       "-ctk", "q4_0", "-ctv", "q4_0", "-fa", "on", "--batch-size", "512",
-                       "--simple-io", "--single-turn", "--no-display-prompt", "--log-disable"]
+                       "-n", "2048", "--temp", temperature, "-dev", cuda_device, "-ngl", "999", "-c", "32768",
+                       "--simple-io", "--conversation", "--single-turn", "--no-display-prompt"]
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                        encoding="utf-8", errors="replace",
                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), env=runtime_environment())
@@ -595,15 +595,7 @@ def local_chat(models_dir: str | Path, model: str, messages: list[dict], timeout
         if marker_at >= 0: output = output[marker_at + len(input_marker):]
         if "\n[ Prompt:" in output: output = output.split("\n[ Prompt:", 1)[0]
         output = output.split("\nExiting...", 1)[0].strip()
-        if output.startswith("Loading model..."):
-            # llama.cpp can emit its interactive banner on stdout despite --simple-io.
-            # Keep only text after the prompt echo, if the runtime printed one.
-            marker_at = output.rfind("\n> ")
-            if marker_at >= 0:
-                output = output[marker_at + 1:].split("\n", 1)[-1].strip()
-            else:
-                output = re.sub(r"^Loading model\.\.\.\s*", "", output, count=1).strip()
-            output = re.sub(r"^(?:[▄█▀ ]+\n)+", "", output).strip()
+        output = re.sub(r"\s*\[end of text\]\s*$", "", output, flags=re.IGNORECASE).strip()
         if re.match(r"^Error:\s*request\s*\(\d+\s+tokens\)\s+exceeds\s+the\s+available\s+context", output, re.IGNORECASE):
             raise RuntimeError("Локальная модель отклонила запрос по размеру контекста. Начните новый чат или уменьшите объём вложения.")
         if not output:
@@ -676,7 +668,7 @@ def install_inference_runtime() -> tuple[bool, str]:
     """Download the official llama.cpp CUDA runtime. The app invokes its CLI without a server."""
     log_path = app_data() / "engine_install.log"
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    if runtime_executable(): return True, str(CUDA_RUNTIME_DIR)
+    if runtime_executable() and runtime_chat_executable(): return True, str(CUDA_RUNTIME_DIR)
     CUDA_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     download_dir = app_data() / "runtime_downloads"; download_dir.mkdir(parents=True, exist_ok=True)
     archive = download_dir / "llama-runtime.zip"
@@ -702,17 +694,22 @@ def install_inference_runtime() -> tuple[bool, str]:
                 destination = (CUDA_RUNTIME_DIR / member.filename).resolve()
                 if not destination.is_relative_to(base): raise ValueError("Архив runtime содержит небезопасный путь")
             package.extractall(CUDA_RUNTIME_DIR)
-        if runtime_executable():
+        if runtime_executable() and runtime_chat_executable():
             try: archive.unlink()
             except OSError: pass
             return True, str(CUDA_RUNTIME_DIR)
-        return False, f"В архиве не найден llama-cli.exe. Подробности: {log_path}"
+        return False, f"В архиве не найден llama-cli.exe или llama-completion.exe. Подробности: {log_path}"
     except (OSError, zipfile.BadZipFile, ValueError, urllib.error.URLError) as error:
         return False, f"{error}. Подробности: {log_path}"
 
 
 def runtime_executable() -> Path | None:
     executable = CUDA_RUNTIME_DIR / "llama-cli.exe"
+    return executable if executable.is_file() else None
+
+
+def runtime_chat_executable() -> Path | None:
+    executable = CUDA_RUNTIME_DIR / "llama-completion.exe"
     return executable if executable.is_file() else None
 
 
@@ -853,7 +850,7 @@ class App(tk.Tk):
             if candidate.is_file() and candidate.suffix.lower() == ".gguf": self.model_catalog.setdefault(candidate.stem, candidate.resolve())
         if self.model_catalog and self.model.get() not in self.model_catalog:
             self.model.set(next(iter(self.model_catalog)))
-        self.runtime_ready = runtime_executable() is not None
+        self.runtime_ready = runtime_executable() is not None and runtime_chat_executable() is not None
         self.runtime_installing = False
         self.chats = self._read_chats(); self.active_chat_id = None
         self.chat_history = []; self.chat_attachments = []; self.chat_window = None; self.chat_busy = False
