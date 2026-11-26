@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import base64
 import difflib
+import io
+import keyword
 import math
 import os
 import queue
@@ -16,13 +18,14 @@ import sys
 import threading
 import time
 import tempfile
+import tokenize
 import urllib.request
 import uuid
 import zipfile
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 import tkinter as tk
 import xml.etree.ElementTree as ET
 
@@ -35,6 +38,7 @@ CUDA_RUNTIME_DIR = Path(os.environ.get("APPDATA", Path.home())) / "LocalFileMana
 _INFERENCE_LOCK = threading.RLock()
 _LOADED_MODEL = {"path": None, "runtime": None, "gpu": False}
 EDITABLE_TEXT = {".txt", ".md", ".rst", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".py", ".js", ".ts", ".css", ".log", ".ini", ".yaml", ".yml", ".toml", ".sql", ".sh", ".ps1", ".bat", ".cs", ".java", ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".jsx", ".tsx", ".vue", ".svelte", ".php", ".rb", ".swift", ".kt", ".properties", ".env"}
+LANGUAGE_NAMES = {".py": "Python", ".php": "PHP", ".js": "JavaScript", ".jsx": "JavaScript JSX", ".ts": "TypeScript", ".tsx": "TypeScript JSX", ".vue": "Vue", ".svelte": "Svelte", ".html": "HTML", ".htm": "HTML", ".css": "CSS", ".scss": "SCSS", ".sql": "SQL", ".java": "Java", ".cs": "C#", ".go": "Go", ".rs": "Rust", ".c": "C", ".h": "C header", ".cpp": "C++", ".hpp": "C++ header", ".rb": "Ruby", ".swift": "Swift", ".kt": "Kotlin", ".sh": "Shell", ".ps1": "PowerShell", ".json": "JSON", ".xml": "XML", ".yaml": "YAML", ".yml": "YAML", ".toml": "TOML"}
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
 
@@ -679,7 +683,7 @@ class App(tk.Tk):
         if self.chat_working_dir and not Path(self.chat_working_dir).is_dir(): self.chat_working_dir = ""
         self.chat_project_dirs = [self.chat_working_dir] if self.chat_working_dir else []
         self.last_assistant_answer = ""
-        self._build(); self._refresh_folders(); self._refresh_results(); self._poll()
+        self._build(); self.protocol("WM_DELETE_WINDOW", self._close_app); self._refresh_folders(); self._refresh_results(); self._poll()
         self.after(500, self._ensure_runtime)
 
     def _configure_styles(self):
@@ -801,20 +805,49 @@ class App(tk.Tk):
         RoundedButton(toolbar, text="＋ Чат", command=self.new_chat).grid(row=0, column=5, padx=4)
         RoundedButton(toolbar, text="Обновить", command=self.refresh_cursor_files).grid(row=0, column=6, padx=4)
         split = ttk.Panedwindow(tab, orient="horizontal"); split.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 8))
-        left = ttk.Frame(split, padding=6); left.columnconfigure(0, weight=1); left.rowconfigure(0, weight=1)
+        left = ttk.Frame(split, padding=6); left.columnconfigure(0, weight=1); left.rowconfigure(1, weight=1)
+        search_bar = ttk.Frame(left); search_bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6)); search_bar.columnconfigure(0, weight=1)
+        ttk.Label(search_bar, text="Поиск по содержимому проекта").grid(row=0, column=0, columnspan=2, sticky="w")
+        self.cursor_search_var = tk.StringVar()
+        self.cursor_search_entry = RoundedEntry(search_bar, textvariable=self.cursor_search_var)
+        self.cursor_search_entry.grid(row=1, column=0, sticky="ew")
+        self.cursor_search_entry.bind("<Return>", lambda _e: self.search_cursor_projects())
+        RoundedButton(search_bar, text="Найти", command=self.search_cursor_projects).grid(row=1, column=1, padx=(5, 0))
         self.cursor_tree = ttk.Treeview(left, columns=("size",), show="tree headings", selectmode="browse")
         self.cursor_tree.heading("#0", text="Файлы проекта"); self.cursor_tree.heading("size", text="Размер")
         self.cursor_tree.column("#0", width=300); self.cursor_tree.column("size", width=90)
-        self.cursor_tree.grid(row=0, column=0, sticky="nsew"); self.cursor_tree.bind("<<TreeviewSelect>>", self._preview_cursor_file)
-        left_scroll = ttk.Scrollbar(left, orient="vertical", command=self.cursor_tree.yview); left_scroll.grid(row=0, column=1, sticky="ns"); self.cursor_tree.configure(yscrollcommand=left_scroll.set)
+        self.cursor_tree.grid(row=1, column=0, sticky="nsew"); self.cursor_tree.bind("<<TreeviewSelect>>", self._preview_cursor_file)
+        left_scroll = ttk.Scrollbar(left, orient="vertical", command=self.cursor_tree.yview); left_scroll.grid(row=1, column=1, sticky="ns"); self.cursor_tree.configure(yscrollcommand=left_scroll.set)
+        self.cursor_search_title = ttk.Label(left, text="Результаты поиска", style="Muted.TLabel")
+        self.cursor_search_results = ttk.Treeview(left, columns=("line", "match"), show="tree headings", height=6, selectmode="browse")
+        self.cursor_search_results.heading("#0", text="Файл"); self.cursor_search_results.heading("line", text="Строка"); self.cursor_search_results.heading("match", text="Совпадение")
+        self.cursor_search_results.column("#0", width=150); self.cursor_search_results.column("line", width=52, stretch=False); self.cursor_search_results.column("match", width=240)
+        self.cursor_search_results.bind("<Double-1>", self._open_cursor_search_hit)
         center = ttk.Frame(split, padding=6); center.columnconfigure(0, weight=1); center.rowconfigure(1, weight=1)
-        ttk.Label(center, text="Код проекта", style="Title.TLabel").grid(row=0, column=0, sticky="w")
-        self.cursor_preview = tk.Text(center, wrap="none", state="disabled", font=("Cascadia Code", 10), background="#ffffff", foreground="#374151", insertbackground="#202123", borderwidth=0, padx=12, pady=10)
-        self.cursor_preview.grid(row=1, column=0, sticky="nsew", pady=6)
-        preview_scroll = ttk.Scrollbar(center, orient="vertical", command=self.cursor_preview.yview); preview_scroll.grid(row=1, column=1, sticky="ns"); self.cursor_preview.configure(yscrollcommand=preview_scroll.set)
-        center_actions = ttk.Frame(center); center_actions.grid(row=2, column=0, sticky="ew")
-        RoundedButton(center_actions, text="Открыть файл", command=self.open_project_file).pack(side="left", padx=2)
-        RoundedButton(center_actions, text="Прикрепить к чату", command=self.attach_cursor_file).pack(side="left", padx=2)
+        editor_toolbar = ttk.Frame(center); editor_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 5)); editor_toolbar.columnconfigure(0, weight=1)
+        self.cursor_editor_path_var = tk.StringVar(value="Откройте файл проекта")
+        ttk.Label(editor_toolbar, textvariable=self.cursor_editor_path_var, style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        RoundedButton(editor_toolbar, text="Новый файл", command=self.new_cursor_file).grid(row=0, column=1, padx=2)
+        RoundedButton(editor_toolbar, text="Найти", command=self.find_in_cursor_editor).grid(row=0, column=2, padx=2)
+        self.cursor_completion_button = RoundedButton(editor_toolbar, text="LLM-вставка", command=self.suggest_cursor_completion)
+        self.cursor_completion_button.grid(row=0, column=3, padx=2)
+        RoundedButton(editor_toolbar, text="Заменить", command=self.replace_in_cursor_editor).grid(row=0, column=4, padx=2)
+        RoundedButton(editor_toolbar, text="К строке", command=self.goto_cursor_line).grid(row=0, column=5, padx=2)
+        RoundedButton(editor_toolbar, text="Сохранить", command=self.save_cursor_file, style="Accent.TButton").grid(row=0, column=6, padx=2)
+        RoundedButton(editor_toolbar, text="Закрыть вкладку", command=self.close_cursor_editor).grid(row=0, column=7, padx=2)
+        self.cursor_editor_tabs = ttk.Notebook(center); self.cursor_editor_tabs.grid(row=1, column=0, sticky="nsew")
+        self.cursor_editor_tabs.bind("<<NotebookTabChanged>>", self._cursor_editor_tab_changed)
+        self.cursor_editor_tabs.bind("<Control-w>", lambda _e: self.close_cursor_editor())
+        editor_actions = ttk.Frame(center); editor_actions.grid(row=2, column=0, sticky="ew", pady=(5, 0))
+        self.cursor_editor_status = tk.StringVar(value="Готово · Ctrl+S сохранить · Ctrl+F найти")
+        ttk.Label(editor_actions, textvariable=self.cursor_editor_status, style="Muted.TLabel").pack(side="left")
+        RoundedButton(editor_actions, text="Проверить PHP", command=self.check_php_syntax).pack(side="right", padx=2)
+        RoundedButton(editor_actions, text="Класс / функция", command=self.go_to_symbol).pack(side="right", padx=2)
+        RoundedButton(editor_actions, text="Найти использования", command=self.find_cursor_usages).pack(side="right", padx=2)
+        RoundedButton(editor_actions, text="Открыть внешне", command=self.open_project_file).pack(side="right", padx=2)
+        RoundedButton(editor_actions, text="Прикрепить к чату", command=self.attach_cursor_file).pack(side="right", padx=2)
+        self.cursor_open_files = {}; self.cursor_active_path = None; self.cursor_search_hits = {}
+        self.cursor_symbol_cache = {}
         right = ttk.Frame(split, padding=8); right.columnconfigure(0, weight=1); right.rowconfigure(1, weight=1)
         cursor_head = ttk.Frame(right); cursor_head.grid(row=0, column=0, sticky="ew"); cursor_head.columnconfigure(1, weight=1)
         ttk.Label(cursor_head, text="Модель:").grid(row=0, column=0)
@@ -844,6 +877,7 @@ class App(tk.Tk):
             self.chat_display, self.chat_input = self.cursor_chat_display, self.cursor_chat_input
             self.chat_send_button, self.chat_edit_button, self.chat_save_button = self.cursor_chat_send_button, self.cursor_chat_edit_button, self.cursor_chat_save_button
             self.chat_folder_label = self.cursor_folder_label; self.attached_label = self.cursor_attached_label
+            self._cursor_editor_tab_changed()
             self._refresh_cursor_chats(); self._render_chat()
         else:
             self.chat_display, self.chat_input = self.main_chat_display, self.main_chat_input
@@ -855,6 +889,11 @@ class App(tk.Tk):
         projects = list(dict.fromkeys(p for p in self.chat_project_dirs if Path(p).is_dir()))
         self.cursor_projects = projects; self.cursor_project_box.configure(values=tuple(projects))
         self.cursor_folder_label.set(self.chat_working_dir if self.chat_working_dir in projects else (projects[-1] if projects else "Выберите рабочую папку проекта"))
+    def _clear_cursor_search_results(self):
+        self.cursor_search_generation = getattr(self, "cursor_search_generation", 0) + 1
+        if hasattr(self, "cursor_search_results"):
+            self.cursor_search_results.delete(*self.cursor_search_results.get_children()); self.cursor_search_results.grid_remove(); self.cursor_search_title.grid_remove()
+            self.cursor_search_hits = {}
     def _refresh_cursor_chats(self):
         if not hasattr(self, "cursor_chat_box"): return
         self.cursor_chat_ids = [c["id"] for c in sorted(self.chats, key=lambda c: c.get("updated", 0), reverse=True)]
@@ -880,7 +919,613 @@ class App(tk.Tk):
         self.chat_working_dir = folder; self.project_file_path = None
         self.chat_folder_label.set(folder); self.cursor_folder_label.set(folder)
         self.config_data["chat_working_dir"] = folder; write_config(self.config_data)
-        self._refresh_cursor_projects(); self.refresh_cursor_files(); self.refresh_project_files(); self._save_current_chat()
+        self._refresh_cursor_projects(); self._clear_cursor_search_results(); self.refresh_cursor_files(); self.refresh_project_files(); self._save_current_chat()
+    def new_cursor_file(self):
+        roots = [p for p in self.chat_project_dirs if Path(p).is_dir()]
+        if not roots:
+            messagebox.showinfo(APP_NAME, "Сначала добавьте папку проекта."); return
+        path = filedialog.asksaveasfilename(title="Новый файл проекта", initialdir=self.chat_working_dir if Path(self.chat_working_dir).is_dir() else roots[0],
+                                            initialfile="new_file.py", filetypes=[("Все файлы", "*.*")])
+        if not path: return
+        target = Path(path).resolve()
+        if not any(target.is_relative_to(Path(root).resolve()) for root in roots):
+            messagebox.showwarning(APP_NAME, "Новый файл можно создать только внутри одного из открытых проектов."); return
+        try:
+            with target.open("x", encoding="utf-8", newline="") as stream: stream.write("")
+        except FileExistsError:
+            self.open_cursor_file(target); return
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f"Не удалось создать файл: {e}"); return
+        self.refresh_cursor_files(); self.open_cursor_file(target)
+    def _cursor_editor_record(self, path=None):
+        key = str(Path(path or self.cursor_active_path).resolve()) if (path or self.cursor_active_path) else None
+        return self.cursor_open_files.get(key) if key else None
+    def open_cursor_file(self, path, line=None):
+        path = Path(path).resolve()
+        if not path.is_file(): return
+        roots = [Path(root).resolve() for root in self.chat_project_dirs if Path(root).is_dir()]
+        if roots and not any(path.is_relative_to(root) for root in roots):
+            messagebox.showwarning(APP_NAME, "Редактор открывает файлы только из подключённых проектов."); return
+        key = str(path)
+        record = self.cursor_open_files.get(key)
+        if record:
+            self.cursor_editor_tabs.select(record["frame"])
+            self.cursor_active_path = key
+            if line: self._cursor_goto_line(record, line)
+            self.project_file_path = path
+            self._cursor_editor_tab_changed()
+            return
+        try:
+            if path.stat().st_size > 5_000_000: raise ValueError("Редактор открывает текстовые файлы размером до 5 МБ.")
+            if is_plain_text_file(path):
+                text, encoding = read_editable_text(path); editable = True
+            elif path.suffix.lower() in SUPPORTED:
+                text, encoding, editable = extract_text(path)[:100000], "utf-8", False
+            else:
+                text, encoding, editable = "Для этого формата доступен чат по файлу, но нет текстового редактора.", "utf-8", False
+        except (OSError, UnicodeError, ValueError, ImportError, zipfile.BadZipFile) as e:
+            messagebox.showerror(APP_NAME, f"Не удалось открыть файл: {e}"); return
+        newline = "\r\n" if "\r\n" in text else "\n"
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        frame = ttk.Frame(self.cursor_editor_tabs); frame.columnconfigure(1, weight=1); frame.rowconfigure(0, weight=1)
+        gutter = tk.Text(frame, width=5, wrap="none", state="disabled", takefocus=False, font=("Cascadia Code", 10), background="#f7f7f8", foreground="#8b9098", borderwidth=0, padx=8, pady=10)
+        gutter.grid(row=0, column=0, sticky="ns")
+        editor = tk.Text(frame, wrap="none", undo=True, maxundo=-1, autoseparators=True, font=("Cascadia Code", 10), background="#ffffff", foreground="#263238", insertbackground="#10a37f", selectbackground="#dff3ed", borderwidth=0, padx=12, pady=10)
+        editor.grid(row=0, column=1, sticky="nsew")
+        yscroll = ttk.Scrollbar(frame, orient="vertical", command=lambda *args: (editor.yview(*args), gutter.yview(*args)))
+        yscroll.grid(row=0, column=2, sticky="ns")
+        xscroll = ttk.Scrollbar(frame, orient="horizontal", command=editor.xview); xscroll.grid(row=1, column=1, sticky="ew")
+        editor.configure(yscrollcommand=lambda first, last: (yscroll.set(first, last), gutter.yview_moveto(first)), xscrollcommand=xscroll.set)
+        for tag, color in (("keyword", "#7c3aed"), ("string", "#15803d"), ("comment", "#87909b"), ("number", "#c2410c"), ("variable", "#0f766e"), ("builtin", "#2563eb"), ("tag", "#b45309"), ("blade", "#be185d")):
+            editor.tag_configure(tag, foreground=color)
+        if editable: editor.insert("1.0", text); editor.edit_modified(False)
+        else: editor.insert("1.0", text); editor.configure(state="disabled")
+        record = {"path": path, "frame": frame, "editor": editor, "gutter": gutter, "encoding": encoding,
+                  "newline": newline, "saved_text": text, "editable": editable, "highlight_after": None, "signature": self._cursor_file_signature(path)}
+        self.cursor_open_files[key] = record
+        self.cursor_editor_tabs.add(frame, text=path.name + ("" if editable else " (просмотр)"))
+        self.cursor_editor_tabs.select(frame); self.cursor_active_path = key; self.project_file_path = path
+        if editable:
+            editor.bind("<<Modified>>", lambda _e, k=key: self._cursor_editor_changed(k))
+            editor.bind("<Control-s>", lambda _e: (self.save_cursor_file(), "break")[1])
+            editor.bind("<Control-f>", lambda _e: (self.find_in_cursor_editor(), "break")[1])
+            editor.bind("<Control-h>", lambda _e: (self.replace_in_cursor_editor(), "break")[1])
+            editor.bind("<Control-g>", lambda _e: (self.goto_cursor_line(), "break")[1])
+            editor.bind("<Control-a>", lambda _e: (editor.tag_add("sel", "1.0", "end-1c"), "break")[1])
+            editor.bind("<Control-w>", lambda _e: (self.close_cursor_editor(), "break")[1])
+            editor.bind("<Return>", lambda event, k=key: self._cursor_auto_indent(event, k))
+            editor.bind("<Control-Button-1>", lambda event, k=key: self._cursor_go_to_definition(event, k))
+            editor.bind("<F12>", lambda _e, k=key: (self._cursor_go_to_definition(None, k), "break")[1])
+            editor.bind("<Shift-F12>", lambda _e, k=key: (self.find_cursor_usages(k), "break")[1])
+            editor.bind("<Button-3>", lambda event, k=key: self._cursor_symbol_context_menu(event, k))
+            editor.bind("<KeyRelease>", lambda _e, k=key: self._update_cursor_line_numbers(self.cursor_open_files.get(k)))
+        self._update_cursor_line_numbers(record); self._cursor_editor_tab_changed(); self._highlight_cursor_editor(key)
+        if line: self._cursor_goto_line(record, line)
+        if self.main_notebook.select() == str(self.cursor_tab): editor.focus_set()
+    def _cursor_auto_indent(self, event, key):
+        record = self.cursor_open_files.get(key)
+        if not record or not record["editable"]: return
+        editor = record["editor"]
+        line = editor.get("insert linestart", "insert")
+        indent = re.match(r"[ \t]*", line).group(0)
+        trimmed = line.strip()
+        if record["path"].suffix.lower() == ".php" and re.match(r"(?:\}|\]|\)|else\b|elseif\b|catch\b|finally\b|end(?:if|foreach|for|while|switch|section|push|auth)\b)", trimmed, re.IGNORECASE):
+            indent = indent[4:] if indent.endswith("    ") else indent[:-1] if indent.endswith("\t") else indent
+        opens_block = line.rstrip().endswith((":", "{", "[", "("))
+        if record["path"].name.lower().endswith(".blade.php") and re.match(r"@(?:if|unless|foreach|forelse|for|while|section|auth|guest|php)\b", trimmed, re.IGNORECASE): opens_block = True
+        extra = "    " if opens_block else ""
+        editor.insert("insert", "\n" + indent + extra)
+        return "break"
+    @staticmethod
+    def _cursor_file_signature(path):
+        try:
+            stat = path.stat(); return stat.st_mtime_ns, stat.st_size
+        except OSError: return None
+    def _update_cursor_line_numbers(self, record):
+        if not record: return
+        editor, gutter = record["editor"], record["gutter"]
+        line_count = int(editor.index("end-1c").split(".")[0]); numbers = "\n".join(str(i) for i in range(1, max(1, line_count) + 1))
+        gutter.configure(state="normal"); gutter.delete("1.0", "end"); gutter.insert("1.0", numbers); gutter.configure(state="disabled")
+        gutter.yview_moveto(editor.yview()[0])
+    def _cursor_editor_changed(self, key):
+        record = self.cursor_open_files.get(key)
+        if not record: return
+        editor = record["editor"]
+        if editor.edit_modified():
+            editor.edit_modified(False)
+            dirty = editor.get("1.0", "end-1c") != record["saved_text"]
+            record["dirty"] = dirty
+            self.cursor_symbol_cache.pop(key, None)
+            self._refresh_cursor_editor_title(record)
+            self._update_cursor_line_numbers(record)
+            if record.get("highlight_after"):
+                try: self.after_cancel(record["highlight_after"])
+                except tk.TclError: pass
+            record["highlight_after"] = self.after(220, lambda k=key: self._highlight_cursor_editor(k))
+    def _refresh_cursor_editor_title(self, record):
+        suffix = " •" if record.get("dirty") else (" (просмотр)" if not record["editable"] else "")
+        try: self.cursor_editor_tabs.tab(record["frame"], text=record["path"].name + suffix)
+        except tk.TclError: pass
+    def _highlight_cursor_editor(self, key):
+        record = self.cursor_open_files.get(key)
+        if not record or not record["editable"]: return
+        editor = record["editor"]; text = editor.get("1.0", "end-1c")
+        for tag in ("keyword", "string", "comment", "number", "variable", "builtin", "tag"): editor.tag_remove(tag, "1.0", "end")
+        try:
+            if record["path"].suffix.lower() == ".py":
+                for token in tokenize.generate_tokens(io.StringIO(text).readline):
+                    kind = "keyword" if token.type == tokenize.NAME and keyword.iskeyword(token.string) else {tokenize.STRING: "string", tokenize.COMMENT: "comment", tokenize.NUMBER: "number"}.get(token.type)
+                    if kind: editor.tag_add(kind, f"{token.start[0]}.{token.start[1]}", f"{token.end[0]}.{token.end[1]}")
+            elif record["path"].suffix.lower() == ".php":
+                php_tokens = r"(?P<comment>//[^\n]*|\#(?!\[)[^\n]*|/\*[\s\S]*?\*/)|(?P<string>'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|`(?:\\.|[^`\\])*`)|(?P<tag><\?php|<\?=|\?>)|(?P<variable>\$[A-Za-z_]\w*)|(?P<number>\b\d+(?:\.\d+)?\b)|(?P<keyword>\b(?:abstract|and|array|as|break|callable|case|catch|class|clone|const|continue|declare|default|die|do|echo|else|elseif|empty|endfor|endforeach|endif|endswitch|endwhile|enum|eval|exit|extends|final|finally|fn|for|foreach|function|global|goto|if|implements|include|include_once|instanceof|insteadof|interface|isset|list|match|namespace|new|or|print|private|protected|public|readonly|require|require_once|return|static|switch|throw|trait|try|unset|use|var|while|xor|yield|true|false|null)\b)|(?P<builtin>\b(?:count|strlen|str_contains|str_replace|array_map|array_filter|json_encode|json_decode|htmlspecialchars|preg_match|preg_replace|file_get_contents|file_put_contents|DateTime|PDO|Exception)\b)"
+                for match in re.finditer(php_tokens, text):
+                    kind = match.lastgroup
+                    if kind: editor.tag_add(kind, f"1.0+{match.start()}c", f"1.0+{match.end()}c")
+                if record["path"].name.lower().endswith(".blade.php"):
+                    for match in re.finditer(r"@(?:extends|section|endsection|yield|include|if|elseif|else|endif|foreach|endforeach|forelse|empty|endforelse|csrf|method|auth|guest|endauth|push|endpush|stack|php|endphp|vite)\b|\{\{[\s\S]*?\}\}|\{!![\s\S]*?!!\}", text):
+                        editor.tag_add("blade", f"1.0+{match.start()}c", f"1.0+{match.end()}c")
+            else:
+                patterns = (("comment", r"(?m)(?:#|//).*?$"), ("string", r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"), ("number", r"\b\d+(?:\.\d+)?\b"), ("keyword", r"\b(?:class|def|function|return|if|else|elseif|elif|for|foreach|while|import|from|const|let|var|public|private|protected|namespace|use|echo|async|await|true|false|null|None)\b"))
+                for tag, pattern in patterns:
+                    for match in re.finditer(pattern, text): editor.tag_add(tag, f"1.0+{match.start()}c", f"1.0+{match.end()}c")
+        except (tokenize.TokenError, IndentationError, SyntaxError): pass
+    def _cursor_editor_tab_changed(self, _event=None):
+        selected = self.cursor_editor_tabs.select()
+        record = next((r for r in self.cursor_open_files.values() if str(r["frame"]) == selected), None)
+        if not record: return
+        self.cursor_active_path = str(record["path"])
+        in_workspace = any(record["path"].is_relative_to(Path(root).resolve()) for root in self.chat_project_dirs if Path(root).is_dir())
+        self.project_file_path = record["path"] if in_workspace else None
+        self.cursor_editor_path_var.set(str(record["path"]) + (" •" if record.get("dirty") else ""))
+        state = ("Изменён · Ctrl+S сохранить" if record.get("dirty") else "Только просмотр" if not record["editable"] else "Готово · Ctrl+S сохранить · Ctrl+F найти")
+        if not in_workspace: state = "Файл открыт из другого проекта; он не будет передан в этот чат"
+        self.cursor_editor_status.set(state + f" · {self._cursor_language(record['path'])} · {record['encoding']}")
+        self._update_cursor_line_numbers(record)
+    def _cursor_goto_line(self, record, line):
+        editor = record["editor"]; line = max(1, min(int(line), int(editor.index("end-1c").split(".")[0])))
+        editor.mark_set("insert", f"{line}.0"); editor.see(f"{line}.0"); editor.focus_set()
+    def goto_cursor_line(self):
+        record = self._cursor_editor_record()
+        if not record or not record["editable"]: return
+        line = simpledialog.askinteger("Перейти к строке", "Номер строки:", parent=self, minvalue=1)
+        if line: self._cursor_goto_line(record, line)
+    def _cursor_language(self, path):
+        path = Path(path)
+        if path.name.lower().endswith(".blade.php"): return "Laravel Blade"
+        if path.suffix.lower() == ".php":
+            for root_value in self.chat_project_dirs:
+                root = Path(root_value).resolve()
+                if not path.resolve().is_relative_to(root): continue
+                current = path.parent
+                while current == root or current.is_relative_to(root):
+                    manifest = current / "composer.json"
+                    try:
+                        data = json.loads(manifest.read_text(encoding="utf-8")); requirements = {**data.get("require", {}), **data.get("require-dev", {})}
+                        if "laravel/framework" in requirements: return "PHP (Laravel)"
+                    except (OSError, ValueError, TypeError): pass
+                    if current == root: break
+                    current = current.parent
+        return LANGUAGE_NAMES.get(path.suffix.lower(), "текст")
+    def check_php_syntax(self):
+        record = self._cursor_editor_record()
+        if not record or record["path"].suffix.lower() != ".php":
+            messagebox.showinfo(APP_NAME, "Откройте PHP-файл для проверки синтаксиса."); return
+        if record.get("dirty"):
+            messagebox.showinfo(APP_NAME, "Сначала сохраните PHP-файл (Ctrl+S), затем запустите проверку."); return
+        php = shutil.which("php")
+        if not php:
+            self.cursor_editor_status.set("PHP CLI не найден; для редактирования и LLM-подсказок он не нужен")
+            messagebox.showinfo(APP_NAME, "PHP CLI не найден в PATH. Редактор и локальные LLM-подстановки работают без него."); return
+        path = record["path"]; self.cursor_editor_status.set("PHP -l проверяет синтаксис без выполнения файла…")
+        def work():
+            try:
+                result = subprocess.run([php, "-l", str(path)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, check=False)
+                output = (result.stdout or result.stderr or "Проверка завершена без сообщения.").strip()
+                self.after(0, lambda: self._php_lint_done(result.returncode, output))
+            except (OSError, subprocess.TimeoutExpired) as e:
+                self.after(0, lambda error=str(e): self._php_lint_done(1, error))
+        threading.Thread(target=work, daemon=True).start()
+    def _php_lint_done(self, code, output):
+        self.cursor_editor_status.set("PHP: синтаксис корректен" if code == 0 else "PHP: найдена ошибка синтаксиса")
+        if code == 0: messagebox.showinfo("Проверка PHP", output)
+        else: messagebox.showwarning("Проверка PHP", output)
+    def suggest_cursor_completion(self):
+        record = self._cursor_editor_record()
+        if not record or not record["editable"]:
+            messagebox.showinfo(APP_NAME, "Откройте текстовый или кодовый файл для LLM-вставки."); return
+        if getattr(self, "cursor_completion_busy", False) or self.chat_busy:
+            self.cursor_editor_status.set("Дождитесь завершения текущего запроса"); return
+        editor = record["editor"]; selection = editor.tag_ranges("sel")
+        if selection: start, end = str(selection[0]), str(selection[1])
+        else: start = end = editor.index("insert")
+        prefix = editor.get("1.0", start).splitlines()[-35:]
+        suffix = editor.get(end, "end-1c").splitlines()[:20]
+        language = self._cursor_language(record["path"])
+        php_note = " Для PHP соблюдай версию и стиль проекта; если версия неизвестна, избегай необязательных новых конструкций." if "PHP" in language else ""
+        if language in {"PHP (Laravel)", "Laravel Blade"}:
+            php_note += " Учитывай conventions Laravel, существующие routes/controllers/Eloquent-паттерны. Для Blade предпочитай экранированный вывод {{ }}; используй {!! !!} только по явной необходимости. Не придумывай зависимости."
+        prompt = (f"Ты помощник автодополнения кода. Язык файла: {language}.{php_note} "
+                  "Предложи только фрагмент, который нужно вставить в позицию курсора. "
+                  "Не повторяй код до курсора и не оборачивай ответ в markdown. "
+                  "Если выделен участок, верни текст для его замены.\n\n"
+                  f"Файл: {record['path'].name}\nКод до позиции:\n{chr(10).join(prefix)[-7000:]}\n"
+                  f"Выделенный текст: {editor.get(start, end) if selection else '(нет)'}\n"
+                  f"Код после позиции:\n{chr(10).join(suffix)[:4000]}\n\nВставляемый фрагмент:")
+        marker = "cursor_completion_" + uuid.uuid4().hex
+        editor.mark_set(marker + "_start", start); editor.mark_gravity(marker + "_start", "left")
+        editor.mark_set(marker + "_end", end); editor.mark_gravity(marker + "_end", "right")
+        model = self.model.get().strip(); self.cursor_completion_busy = True
+        self.cursor_completion_button.configure(state="disabled")
+        self.cursor_editor_status.set(f"Локальная модель предлагает {language}…")
+        def work():
+            try:
+                answer = local_chat(self.model_dir_var.get(), model, [{"role": "user", "content": prompt}])
+                if not answer or not answer.strip(): raise ValueError("Модель вернула пустое дополнение")
+                self.after(0, lambda: self._show_cursor_completion(record, marker, answer))
+            except Exception as e:
+                self.after(0, lambda error=str(e): self._cursor_completion_error(record, marker, error))
+        threading.Thread(target=work, daemon=True).start()
+    def _cursor_completion_error(self, record, marker, error):
+        self.cursor_completion_busy = False; self.cursor_completion_button.configure(state="normal")
+        self.cursor_editor_status.set("LLM-вставка не получена")
+        if record and record["editor"].winfo_exists():
+            for suffix in ("_start", "_end"):
+                try: record["editor"].mark_unset(marker + suffix)
+                except tk.TclError: pass
+        messagebox.showerror("Локальная модель недоступна", error)
+    def _show_cursor_completion(self, record, marker, answer):
+        self.cursor_completion_busy = False; self.cursor_completion_button.configure(state="normal")
+        code = answer.rstrip("\r\n")
+        if code.lstrip().startswith("```") and code.rstrip().endswith("```"):
+            fenced = code.lstrip().split("\n", 1)
+            if len(fenced) == 2: code = fenced[1].rsplit("```", 1)[0].rstrip("\r\n")
+        if not code.strip():
+            self._cursor_completion_error(record, marker, "Модель вернула пустое дополнение"); return
+        if len(code) > 20000:
+            self._cursor_completion_error(record, marker, "Предложение слишком длинное для автодополнения"); return
+        win = tk.Toplevel(self); win.title(f"Предложение локальной модели — {self._cursor_language(record['path'])}"); win.geometry("760x440")
+        win.columnconfigure(0, weight=1); win.rowconfigure(1, weight=1)
+        ttk.Label(win, text=f"Модель подготовила фрагмент для {record['path'].name}. Он будет добавлен только в несохранённый буфер редактора.", padding=10).grid(row=0, column=0, sticky="w")
+        preview = tk.Text(win, wrap="none", font=("Cascadia Code", 10), background="#ffffff", foreground="#263238", borderwidth=0, padx=12, pady=10)
+        preview.grid(row=1, column=0, sticky="nsew", padx=10); preview.insert("1.0", code); preview.configure(state="disabled")
+        actions = ttk.Frame(win, padding=10); actions.grid(row=2, column=0, sticky="e")
+        RoundedButton(actions, text="Вставить в редактор", command=lambda: self._accept_cursor_completion(record, marker, code, win), style="Accent.TButton").pack(side="left", padx=4)
+        RoundedButton(actions, text="Отмена", command=lambda: self._cancel_cursor_completion(record, marker, win)).pack(side="left", padx=4)
+        win.protocol("WM_DELETE_WINDOW", lambda: self._cancel_cursor_completion(record, marker, win))
+    def _accept_cursor_completion(self, record, marker, code, window):
+        editor = record["editor"]
+        if not editor.winfo_exists() or str(record["frame"]) not in self.cursor_editor_tabs.tabs():
+            window.destroy(); return
+        start, end = marker + "_start", marker + "_end"
+        try:
+            editor.delete(start, end); editor.insert(start, code); editor.mark_set("insert", f"{start}+{len(code)}c")
+            editor.see("insert"); editor.focus_set(); self.cursor_editor_tabs.select(record["frame"])
+        finally:
+            editor.mark_unset(start, end)
+        window.destroy(); self._cursor_editor_changed(str(record["path"])); self.cursor_editor_status.set("Фрагмент вставлен в буфер · Ctrl+S для сохранения")
+    def _cancel_cursor_completion(self, record, marker, window):
+        try: record["editor"].mark_unset(marker + "_start", marker + "_end")
+        except tk.TclError: pass
+        self.cursor_completion_button.configure(state="normal"); self.cursor_completion_busy = False; window.destroy()
+    def find_in_cursor_editor(self):
+        record = self._cursor_editor_record()
+        if not record: return
+        query = simpledialog.askstring("Найти", "Текст для поиска в открытом файле:", parent=self)
+        if not query: return
+        editor = record["editor"]; start = editor.index("insert + 1c")
+        found = editor.search(query, start, stopindex="end", nocase=True) or editor.search(query, "1.0", stopindex=start, nocase=True)
+        if found:
+            editor.tag_remove("find_match", "1.0", "end"); editor.tag_configure("find_match", background="#fff0a6")
+            editor.tag_add("find_match", found, f"{found}+{len(query)}c"); editor.mark_set("insert", found); editor.see(found)
+        else: self.cursor_editor_status.set("Совпадений не найдено")
+    def replace_in_cursor_editor(self):
+        record = self._cursor_editor_record()
+        if not record or not record["editable"]: return
+        old = simpledialog.askstring("Заменить", "Найти текст:", parent=self)
+        if not old: return
+        new = simpledialog.askstring("Заменить", "Заменить на:", parent=self)
+        if new is None: return
+        editor = record["editor"]; content = editor.get("1.0", "end-1c"); updated = content.replace(old, new)
+        if updated != content:
+            editor.delete("1.0", "end"); editor.insert("1.0", updated); self.cursor_editor_status.set(f"Заменено совпадений: {content.count(old)}")
+        else: self.cursor_editor_status.set("Совпадений не найдено")
+    def save_cursor_file(self):
+        record = self._cursor_editor_record()
+        if not record or not record["editable"]: return
+        if not record.get("dirty"):
+            self.cursor_editor_status.set("Нет несохранённых изменений"); return
+        path = record["path"]; current_signature = self._cursor_file_signature(path)
+        if current_signature != record.get("signature") and not messagebox.askyesno("Файл изменён снаружи", f"{path.name} изменился на диске после открытия. Перезаписать текущей версией редактора?", parent=self): return
+        text = record["editor"].get("1.0", "end-1c")
+        try:
+            backup = path.with_name(path.name + ".backup-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
+            shutil.copy2(path, backup)
+            path.write_bytes(text.replace("\n", record.get("newline", "\n")).encode(record["encoding"]))
+            record["saved_text"] = text; record["dirty"] = False; record["signature"] = self._cursor_file_signature(path)
+            self._refresh_cursor_editor_title(record); self.cursor_editor_status.set(f"Сохранено · backup: {backup.name}")
+            self.index.refresh_path(path); self._refresh_results()
+        except (OSError, UnicodeError) as e: messagebox.showerror(APP_NAME, f"Не удалось сохранить файл: {e}", parent=self)
+    def close_cursor_editor(self):
+        record = self._cursor_editor_record()
+        if not record: return
+        if record.get("dirty"):
+            decision = messagebox.askyesnocancel("Несохранённые изменения", f"Сохранить изменения в {record['path'].name} перед закрытием?", parent=self)
+            if decision is None: return
+            if decision:
+                self.save_cursor_file()
+                if record.get("dirty"): return
+        self.cursor_editor_tabs.forget(record["frame"]); self.cursor_open_files.pop(str(record["path"]), None)
+        self.cursor_active_path = None; self.cursor_editor_path_var.set("Откройте файл проекта")
+        self.cursor_editor_status.set("Вкладка закрыта")
+    def search_cursor_projects(self):
+        query = self.cursor_search_var.get().strip()
+        if not query: return
+        self.cursor_search_generation = getattr(self, "cursor_search_generation", 0) + 1
+        generation = self.cursor_search_generation; roots = list(self.chat_project_dirs)
+        open_buffers = {key: record["editor"].get("1.0", "end-1c") for key, record in self.cursor_open_files.items() if record["editable"]}
+        self.cursor_search_results.delete(*self.cursor_search_results.get_children()); self.cursor_search_hits = {}
+        self.cursor_search_title.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 2))
+        self.cursor_search_results.grid(row=3, column=0, columnspan=2, sticky="ew")
+        self.cursor_editor_status.set("Поиск по всем проектам…")
+        def work():
+            found = []; ignored = {".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build"}; seen = set(); bytes_read = 0
+            for root in roots:
+                base = Path(root)
+                if not base.is_dir(): continue
+                for path in base.rglob("*"):
+                    try:
+                        if not path.is_file() or any(part in ignored for part in path.relative_to(base).parts): continue
+                        stat = path.stat()
+                        if stat.st_size > 2_000_000 or bytes_read + stat.st_size > 250_000_000 or not is_plain_text_file(path): continue
+                        resolved = path.resolve()
+                        if not any(resolved.is_relative_to(Path(root).resolve()) for root in roots if Path(root).is_dir()): continue
+                        if resolved in seen: continue
+                        seen.add(resolved); bytes_read += stat.st_size
+                        content = open_buffers.get(str(resolved))
+                        if content is None: content, _encoding = read_editable_text(path)
+                        for line_number, line in enumerate(content.splitlines(), 1):
+                            if query.casefold() in line.casefold(): found.append((resolved, str(base), path.relative_to(base), line_number, line.strip()[:180]))
+                            if len(found) >= 1000: break
+                        if len(found) >= 1000 or bytes_read >= 250_000_000: break
+                    except (OSError, UnicodeError, ValueError): continue
+                if len(found) >= 1000 or bytes_read >= 250_000_000: break
+            try: self.after(0, lambda: self._render_cursor_search_results(found, query, generation))
+            except tk.TclError: pass
+        threading.Thread(target=work, daemon=True).start()
+    def _render_cursor_search_results(self, found, query, generation):
+        if generation != getattr(self, "cursor_search_generation", 0): return
+        self.cursor_search_results.delete(*self.cursor_search_results.get_children()); self.cursor_search_hits = {}
+        for index, (path, project_name, relative, line, excerpt) in enumerate(found):
+            iid = str(index); self.cursor_search_hits[iid] = (path, line)
+            self.cursor_search_results.insert("", "end", iid=iid, text=f"{project_name}/{relative}", values=(line, excerpt))
+        self.cursor_editor_status.set(f"Найдено строк: {len(found)} для «{query}»" if found else f"Совпадений нет: «{query}»")
+    @staticmethod
+    def _parse_cursor_symbols(path, content):
+        suffix = Path(path).suffix.lower(); symbols = []
+        patterns = [
+            ("class", r"^\s*(?:(?:abstract|final|readonly|export|default|public|private|protected|static)\s+)*(?:class|trait|interface|enum|struct|record|type)\s+([A-Za-z_$][\w$]*)"),
+            ("function", r"^\s*(?:(?:public|protected|private|static|abstract|final|async|export|default|func|fn|fun|def|function|inline|virtual|override|constexpr|\*|&)\s+)*(?:function\s*&?|func\s+(?:\([^)]*\)\s*)?|(?:def|fn|fun)\s+)([A-Za-z_$][\w$]*)\s*(?:<[^>]*>\s*)?\("),
+            ("function", r"^\s*(?:(?:export|default|const|let|var|public|private|static|async)\s+)+(?:const\s+|let\s+|var\s+)?([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>"),
+            ("function", r"^\s*(?:(?:public|protected|private|static|abstract|final|async|export|virtual|override|inline|extern|constexpr|friend|\*|&)\s+)*(?:[A-Za-z_$][\w.$<>\[\],?]*\s+)+([A-Za-z_$][\w$]*)\s*\([^;]*\)\s*(?:const\s*)?(?:throws\s+[^{}]+)?(?:\{|$)"),
+        ]
+        if suffix in {".php", ".py", ".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte", ".java", ".cs", ".go", ".rs", ".rb", ".swift", ".kt", ".c", ".h", ".cpp", ".hpp"}:
+            for line_number, line in enumerate(content.splitlines(), 1):
+                stripped = line.lstrip()
+                if not stripped or stripped.startswith(("//", "#", "*", "/*")): continue
+                for kind, pattern in patterns:
+                    match = re.search(pattern, line)
+                    if match:
+                        name = match.group(1)
+                        if name not in {"if", "for", "while", "switch", "catch", "return", "new"}:
+                            symbols.append((line_number, kind, name))
+                        break
+        return symbols
+    def go_to_symbol(self):
+        if getattr(self, "cursor_symbol_win", None) and self.cursor_symbol_win.winfo_exists():
+            self.cursor_symbol_win.deiconify(); self.cursor_symbol_query.set(""); self.cursor_symbol_tree.focus_set(); return
+        roots = [Path(root).resolve() for root in self.chat_project_dirs if Path(root).is_dir()]
+        if not roots:
+            messagebox.showinfo(APP_NAME, "Сначала добавьте папки проектов."); return
+        win = tk.Toplevel(self); win.title("Перейти к классу или функции"); win.geometry("850x540"); win.columnconfigure(0, weight=1); win.rowconfigure(2, weight=1)
+        ttk.Label(win, text="Ищет классы, интерфейсы и функции по всем файлам подключённых проектов.", padding=(10, 8)).grid(row=0, column=0, sticky="w")
+        query_var = tk.StringVar()
+        query = RoundedEntry(win, textvariable=query_var); query.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 7)); query.focus_set()
+        tree = ttk.Treeview(win, columns=("location",), show="tree headings", selectmode="browse")
+        tree.heading("#0", text="Символ"); tree.heading("location", text="Расположение"); tree.column("#0", width=240); tree.column("location", width=560)
+        tree.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        scroll = ttk.Scrollbar(win, orient="vertical", command=tree.yview); scroll.grid(row=2, column=1, sticky="ns", pady=(0, 10)); tree.configure(yscrollcommand=scroll.set)
+        self.cursor_symbol_win = win; self.cursor_symbol_tree = tree; self.cursor_symbol_query = query_var; self.cursor_symbol_rows = []
+        label = ttk.Label(win, text="Индексация символов локально…", style="Muted.TLabel", padding=(10, 0, 10, 8)); label.grid(row=3, column=0, sticky="w")
+        open_buffers = {key: record["editor"].get("1.0", "end-1c") for key, record in self.cursor_open_files.items() if record["editable"]}
+        old_cache = dict(self.cursor_symbol_cache); supported = {".php", ".py", ".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte", ".java", ".cs", ".go", ".rs", ".rb", ".swift", ".kt", ".c", ".h", ".cpp", ".hpp"}
+        def work():
+            rows = []; cache = {}; ignored = {".git", "node_modules", ".venv", "venv", "vendor", "dist", "build", "__pycache__"}; scanned = 0
+            for base in roots:
+                for folder, dirs, files in os.walk(base):
+                    dirs[:] = sorted(d for d in dirs if d not in ignored)
+                    for name in files:
+                        path = Path(folder) / name
+                        try:
+                            if path.suffix.lower() not in supported or path.stat().st_size > 2_000_000: continue
+                            resolved = path.resolve()
+                            if not resolved.is_relative_to(base): continue
+                            signature = self._cursor_file_signature(resolved); key = str(resolved)
+                            if key in open_buffers:
+                                content = open_buffers[key]; symbols = self._parse_cursor_symbols(resolved, content)
+                            elif key in old_cache and old_cache[key][0] == signature:
+                                symbols = old_cache[key][1]
+                            else:
+                                if not is_plain_text_file(resolved): continue
+                                content, _encoding = read_editable_text(resolved); symbols = self._parse_cursor_symbols(resolved, content)
+                            cache[key] = (signature, symbols); scanned += 1
+                            for line_number, kind, symbol in symbols: rows.append((symbol.casefold(), symbol, kind, resolved, line_number, str(base)))
+                            if scanned >= 20000: break
+                        except (OSError, UnicodeError, ValueError): continue
+                    if scanned >= 20000: break
+                if scanned >= 20000: break
+            try: self.after(0, lambda: self._show_cursor_symbols(win, label, tree, query_var, rows, cache))
+            except tk.TclError: pass
+        threading.Thread(target=work, daemon=True).start()
+        query_var.trace_add("write", lambda *_: self._filter_cursor_symbols())
+        tree.bind("<Double-1>", lambda _e: self._open_cursor_symbol(win))
+        tree.bind("<Return>", lambda _e: self._open_cursor_symbol(win))
+    def _show_cursor_symbols(self, window, label, tree, query_var, rows, cache):
+        if not window.winfo_exists(): return
+        self.cursor_symbol_cache.update(cache); self.cursor_symbol_rows = rows
+        label.configure(text=f"Символов найдено: {len(rows)} · Enter или двойной щелчок для перехода")
+        self._filter_cursor_symbols()
+    def _filter_cursor_symbols(self):
+        tree = getattr(self, "cursor_symbol_tree", None)
+        if not tree or not tree.winfo_exists(): return
+        query = self.cursor_symbol_query.get().casefold(); tree.delete(*tree.get_children()); visible = 0
+        for index, (_fold, symbol, kind, path, line, root) in enumerate(self.cursor_symbol_rows):
+            if query and query not in symbol.casefold() and query not in str(path).casefold(): continue
+            iid = str(index); tree.insert("", "end", iid=iid, text=f"{symbol}  ·  {kind}", values=(f"{path} : {line}",)); visible += 1
+            if visible >= 2000: break
+    def _open_cursor_symbol(self, window):
+        tree = self.cursor_symbol_tree; selection = tree.selection()
+        if not selection: return
+        index = int(selection[0]); _fold, _symbol, _kind, path, line, _root = self.cursor_symbol_rows[index]
+        self.open_cursor_file(path, line); window.destroy()
+    @staticmethod
+    def _cursor_token_at(record, event=None):
+        editor = record["editor"]
+        index = editor.index(f"@{event.x},{event.y}") if event is not None else editor.index("insert")
+        line_number, column = (int(part) for part in index.split("."))
+        line = editor.get(f"{line_number}.0", f"{line_number}.end")
+        pattern = r"\$?[A-Za-z_][A-Za-z0-9_]*" if record["path"].suffix.lower() == ".php" or record["path"].name.lower().endswith(".blade.php") else r"[A-Za-z_$][A-Za-z0-9_$]*"
+        for match in re.finditer(pattern, line):
+            if match.start() <= column <= match.end(): return match.group(0)
+        return ""
+    def _cursor_symbol_context_menu(self, event, key):
+        record = self.cursor_open_files.get(key)
+        if not record: return "break"
+        token = self._cursor_token_at(record, event)
+        if not token: return "break"
+        menu = tk.Menu(self, tearoff=False)
+        menu.add_command(label=f"Перейти к определению «{token}»   Ctrl+клик", command=lambda: self._cursor_go_to_definition(None, key, token))
+        menu.add_command(label=f"Найти использования «{token}»   Shift+F12", command=lambda: self.find_cursor_usages(key, token))
+        menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+    def _cursor_go_to_definition(self, event=None, key=None, token=None):
+        record = self.cursor_open_files.get(key) if key else self._cursor_editor_record()
+        if not record: return "break" if event is not None else None
+        if event is not None: record["editor"].mark_set("insert", f"@{event.x},{event.y}")
+        token = token or self._cursor_token_at(record, event)
+        if not token:
+            self.go_to_symbol(); return "break" if event is not None else None
+        roots = [Path(root).resolve() for root in self.chat_project_dirs if Path(root).is_dir()]
+        buffers = {name: item["editor"].get("1.0", "end-1c") for name, item in self.cursor_open_files.items() if item["editable"]}
+        self.cursor_editor_status.set(f"Поиск объявления «{token}»…")
+        def work():
+            results = []; ignored = {".git", "node_modules", ".venv", "venv", "vendor", "dist", "build", "__pycache__"}
+            supported = {".php", ".py", ".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte", ".java", ".cs", ".go", ".rs", ".rb", ".swift", ".kt", ".c", ".h", ".cpp", ".hpp"}
+            for root in roots:
+                for folder, dirs, files in os.walk(root):
+                    dirs[:] = sorted(d for d in dirs if d not in ignored)
+                    for name in files:
+                        path = Path(folder) / name
+                        try:
+                            resolved = path.resolve()
+                            if not resolved.is_relative_to(root) or path.suffix.lower() not in supported or path.stat().st_size > 2_000_000: continue
+                            content = buffers.get(str(resolved))
+                            if content is None:
+                                if not is_plain_text_file(resolved): continue
+                                content, _encoding = read_editable_text(resolved)
+                            for line, kind, symbol in self._parse_cursor_symbols(resolved, content):
+                                same = symbol.casefold() == token.casefold() if path.suffix.lower() == ".php" else symbol == token
+                                if same: results.append((resolved, line, kind))
+                        except (OSError, UnicodeError, ValueError): continue
+            try: self.after(0, lambda: self._cursor_definition_results(token, results))
+            except tk.TclError: pass
+        threading.Thread(target=work, daemon=True).start()
+        return "break" if event is not None else None
+    def _cursor_definition_results(self, token, results):
+        if not results:
+            self.cursor_editor_status.set(f"Объявление «{token}» не найдено в подключённых проектах"); return
+        if len(results) == 1:
+            path, line, _kind = results[0]; self.open_cursor_file(path, line); return
+        win = tk.Toplevel(self); win.title(f"Определения: {token}"); win.geometry("760x380"); win.columnconfigure(0, weight=1); win.rowconfigure(0, weight=1)
+        tree = ttk.Treeview(win, columns=("location",), show="tree headings"); tree.heading("#0", text="Тип"); tree.heading("location", text="Файл и строка"); tree.column("#0", width=120); tree.column("location", width=600); tree.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        for index, (path, line, kind) in enumerate(results): tree.insert("", "end", iid=str(index), text=kind, values=(f"{path} : {line}",))
+        def open_selected(_event=None):
+            selection = tree.selection()
+            if selection:
+                path, line, _kind = results[int(selection[0])]; self.open_cursor_file(path, line); win.destroy()
+        tree.bind("<Double-1>", open_selected); tree.bind("<Return>", open_selected)
+    def find_cursor_usages(self, key=None, token=None):
+        record = self.cursor_open_files.get(key) if key else self._cursor_editor_record()
+        if not record: return
+        token = token or self._cursor_token_at(record)
+        if not token:
+            messagebox.showinfo(APP_NAME, "Поставьте курсор на имя функции, класса или переменной."); return
+        roots = [Path(root).resolve() for root in self.chat_project_dirs if Path(root).is_dir()]
+        if not roots:
+            messagebox.showinfo(APP_NAME, "Сначала добавьте папки проектов."); return
+        win = tk.Toplevel(self); win.title(f"Использования: {token}"); win.geometry("1000x560"); win.columnconfigure(0, weight=1); win.rowconfigure(1, weight=1)
+        ttk.Label(win, text=f"Локальный поиск точных упоминаний «{token}» по подключённым проектам.", padding=8).grid(row=0, column=0, sticky="w")
+        tree = ttk.Treeview(win, columns=("line", "context"), show="tree headings"); tree.heading("#0", text="Файл"); tree.heading("line", text="Строка"); tree.heading("context", text="Код вокруг упоминания"); tree.column("#0", width=300); tree.column("line", width=65); tree.column("context", width=580); tree.grid(row=1, column=0, sticky="nsew", padx=8, pady=6)
+        scroll = ttk.Scrollbar(win, orient="vertical", command=tree.yview); scroll.grid(row=1, column=1, sticky="ns", pady=6); tree.configure(yscrollcommand=scroll.set)
+        label = ttk.Label(win, text="Ищу по проектам…", style="Muted.TLabel", padding=8); label.grid(row=2, column=0, sticky="w")
+        buffers = {name: item["editor"].get("1.0", "end-1c") for name, item in self.cursor_open_files.items() if item["editable"]}
+        usage_rows = []
+        self.cursor_usages_win, self.cursor_usages_tree, self.cursor_usages_rows = win, tree, usage_rows
+        def work():
+            found = []; seen = set(); ignored = {".git", "node_modules", ".venv", "venv", "vendor", "dist", "build", "__pycache__"}; bytes_read = 0
+            pattern = re.compile(r"(?<![A-Za-z0-9_$])" + re.escape(token) + r"(?![A-Za-z0-9_$])", re.IGNORECASE if record["path"].suffix.lower() == ".php" else 0)
+            for root in roots:
+                for folder, dirs, files in os.walk(root):
+                    dirs[:] = sorted(d for d in dirs if d not in ignored)
+                    for name in files:
+                        path = Path(folder) / name
+                        try:
+                            resolved = path.resolve(); stat = path.stat()
+                            if not resolved.is_relative_to(root) or stat.st_size > 2_000_000 or bytes_read + stat.st_size > 250_000_000 or not is_plain_text_file(resolved) or resolved in seen: continue
+                            seen.add(resolved); bytes_read += stat.st_size
+                            content = buffers.get(str(resolved))
+                            if content is None: content, _encoding = read_editable_text(resolved)
+                            for line_number, line in enumerate(content.splitlines(), 1):
+                                if pattern.search(line): found.append((resolved, line_number, line.strip()[:220]))
+                                if len(found) >= 2000: break
+                            if len(found) >= 2000 or bytes_read >= 250_000_000: break
+                        except (OSError, UnicodeError, ValueError): continue
+                    if len(found) >= 2000 or bytes_read >= 250_000_000: break
+                if len(found) >= 2000 or bytes_read >= 250_000_000: break
+            try: self.after(0, lambda: self._show_cursor_usages(win, label, tree, found, usage_rows))
+            except tk.TclError: pass
+        threading.Thread(target=work, daemon=True).start()
+        def open_usage(_event=None):
+            selection = tree.selection()
+            if not selection: return
+            index = int(selection[0]); path, line, excerpt = usage_rows[index]
+            self.open_cursor_file(path, line)
+            editor_record = self._cursor_editor_record(path)
+            if editor_record:
+                editor = editor_record["editor"]; position = "1.0"; needle = token
+                found_at = editor.search(needle, f"{line}.0", stopindex=f"{line}.end", nocase=path.suffix.lower() == ".php")
+                if found_at:
+                    editor.tag_add("sel", found_at, f"{found_at}+{len(needle)}c"); editor.mark_set("insert", found_at); editor.see(found_at)
+            win.destroy()
+        tree.bind("<Double-1>", open_usage); tree.bind("<Return>", open_usage)
+    def _show_cursor_usages(self, window, label, tree, found, rows):
+        if not window.winfo_exists(): return
+        rows.extend(found)
+        for index, (path, line, excerpt) in enumerate(found): tree.insert("", "end", iid=str(index), text=str(path), values=(line, excerpt))
+        label.configure(text=f"Найдено упоминаний: {len(found)}" if found else "Упоминаний не найдено")
+    def _open_cursor_search_hit(self, _event=None):
+        selection = self.cursor_search_results.selection()
+        if not selection: return
+        path, line = self.cursor_search_hits[selection[0]]; self.open_cursor_file(path, line)
+    def _close_app(self):
+        for record in list(self.cursor_open_files.values()):
+            if not record.get("dirty"): continue
+            self.cursor_editor_tabs.select(record["frame"]); self._cursor_editor_tab_changed()
+            decision = messagebox.askyesnocancel("Несохранённые изменения", f"Сохранить изменения в {record['path'].name} перед выходом?", parent=self)
+            if decision is None: return
+            if decision:
+                self.save_cursor_file()
+                if record.get("dirty"): return
+        self.destroy()
     def refresh_cursor_files(self):
         if not hasattr(self, "cursor_tree"): return
         self.cursor_tree.delete(*self.cursor_tree.get_children())
@@ -898,6 +1543,7 @@ class App(tk.Tk):
                     if any(part in ignored for part in relative.parts): continue
                     if not path.is_file() or path.stat().st_size > 2_000_000: continue
                     resolved = str(path.resolve())
+                    if not Path(resolved).is_relative_to(base.resolve()): continue
                     if resolved in inserted: continue
                     inserted.add(resolved)
                     self.cursor_tree.insert(root_id, "end", iid=resolved, text=str(relative), values=(human_size(path.stat().st_size),))
@@ -906,18 +1552,9 @@ class App(tk.Tk):
                 except (OSError, tk.TclError): continue
     def _preview_cursor_file(self, _event=None):
         selected = self.cursor_tree.selection()
-        text = ""
         if selected and not selected[0].startswith("root:"):
-            path = Path(selected[0])
-            self.project_file_path = path
-            self.chat_mode_var.set("Режим Cursor")
-            try:
-                if path.suffix.lower() in SUPPORTED: text = extract_text(path)[:50000]
-                elif is_plain_text_file(path): text = read_editable_text(path)[0][:50000]
-                else: text = "Бинарный файл. Для работы с ним прикрепите его в чате, если формат поддерживается."
-            except (OSError, UnicodeError, ValueError, ImportError, zipfile.BadZipFile): text = "Не удалось прочитать файл."
-        self.cursor_preview.configure(state="normal"); self.cursor_preview.delete("1.0", "end"); self.cursor_preview.insert("1.0", text or "Выберите файл проекта")
-        self.cursor_preview.configure(state="disabled")
+            path = Path(selected[0]); self.project_file_path = path; self.chat_mode_var.set("Режим Cursor")
+            self.open_cursor_file(path)
     def attach_cursor_file(self):
         selected = self.cursor_tree.selection()
         if not selected or selected[0].startswith("root:"):
@@ -1112,6 +1749,7 @@ class App(tk.Tk):
         chat = next((item for item in self.chats if item.get("id") == chat_id), None)
         if not chat: return
         self.active_chat_id = chat_id; self.chat_history = list(chat.get("history", []))
+        self._clear_cursor_search_results()
         self.chat_attachments = list(chat.get("attachments", [])); saved_mode = chat.get("mode", "Обычный чат")
         self.chat_mode_var.set("Режим Cursor" if saved_mode == "Код проекта" else saved_mode)
         self.goal_var.set(chat.get("goal", "")); self.last_assistant_answer = chat.get("last_answer", "")
@@ -1124,7 +1762,9 @@ class App(tk.Tk):
         self.chat_folder_label.set(self.chat_working_dir or "Рабочая папка не выбрана")
         if hasattr(self, "cursor_folder_label"):
             self.cursor_folder_label.set(self.chat_working_dir or "Выберите рабочую папку проекта")
+            self._refresh_cursor_projects()
             self.refresh_cursor_files()
+            if getattr(self, "cursor_editor_tabs", None) and self.cursor_editor_tabs.select(): self._cursor_editor_tab_changed()
         self.chat_edit_path = next((Path(item["path"]) for item in reversed(self.chat_attachments) if item.get("path") and Path(item["path"]).is_file()), None)
         self.project_file_path = self.chat_edit_path if self.chat_mode_var.get() == "Режим Cursor" else None
         self.chat_save_button.configure(state="normal" if self.last_assistant_answer else "disabled")
@@ -1441,9 +2081,16 @@ class App(tk.Tk):
             system += "\nРежим Cursor: анализируй только открытый в редакторе файл и явно приложенные файлы. Помогай с кодом и предлагай точные правки. Рабочая папка не означает автоматический доступ к остальным файлам проекта."
             if self.chat_project_dirs: system += "\nПроекты: " + ", ".join(Path(p).name for p in self.chat_project_dirs)
             active_path = getattr(self, "project_file_path", None)
+            if active_path and active_path.suffix.lower() in LANGUAGE_NAMES:
+                language = self._cursor_language(active_path)
+                system += f"\nЯзык открытого файла: {language}. Учитывай его синтаксис и стиль проекта."
+                if "PHP" in language or language == "Laravel Blade":
+                    system += " Для PHP/Laravel не меняй версии или зависимости проекта; используй существующие паттерны и API. В Blade предпочитай экранированный вывод {{ }} и избегай {!! !!}, если пользователь явно не просил обратное."
             if active_path and active_path.is_file() and not any(item.get("path") == str(active_path) for item in self.chat_attachments):
                 try:
-                    active_text = ("Selected image: " + active_path.name if active_path.suffix.lower() in IMAGE_EXTS else
+                    open_record = self._cursor_editor_record(active_path)
+                    active_text = (open_record["editor"].get("1.0", "end-1c") if open_record and open_record["editable"] else
+                                   "Selected image: " + active_path.name if active_path.suffix.lower() in IMAGE_EXTS else
                                    excel_workbook_text(active_path, 50000) if active_path.suffix.lower() in {".xlsx", ".xlsm", ".xls", ".xlsb"}
                                    else extract_text(active_path) if active_path.suffix.lower() in SUPPORTED
                                    else read_editable_text(active_path)[0][:50000] if is_plain_text_file(active_path)
@@ -1538,7 +2185,11 @@ class App(tk.Tk):
                 if len(original) > 120 or sum(len(p["text"]) for p in original) > 30000:
                     messagebox.showinfo(APP_NAME, "Для правки в прототипе выберите DOCX до 120 абзацев и 30 000 символов."); return
             else:
-                original, edit_encoding = read_editable_text(path)
+                editor_record = self._cursor_editor_record(path)
+                if editor_record and editor_record["editable"]:
+                    original = editor_record["editor"].get("1.0", "end-1c"); edit_encoding = editor_record["encoding"]
+                else:
+                    original, edit_encoding = read_editable_text(path)
                 if len(original) > 50000: messagebox.showinfo(APP_NAME, "Для правки выберите текстовый файл не длиннее 50 000 символов."); return
         except (OSError, UnicodeError, ValueError, zipfile.BadZipFile, ET.ParseError, ImportError) as e:
             messagebox.showerror(APP_NAME, f"Не удалось прочитать файл: {e}"); return
@@ -1680,8 +2331,17 @@ class App(tk.Tk):
             shutil.copy2(path, backup)
             if edit_kind == "excel": write_excel_operations(path, temporary, edited)
             elif edit_kind == "docx": write_docx_edits(path, temporary, edited)
-            else: temporary.write_bytes(edited.encode(edit_encoding))
+            else:
+                record = self._cursor_editor_record(path)
+                newline = record.get("newline", "\n") if record else "\n"
+                temporary.write_bytes(edited.replace("\n", newline).encode(edit_encoding))
             temporary.replace(path)
+            editor_record = self._cursor_editor_record(path)
+            if editor_record and editor_record["editable"]:
+                editor = editor_record["editor"]; editor.delete("1.0", "end"); editor.insert("1.0", edited); editor.edit_modified(False)
+                editor_record["saved_text"] = edited; editor_record["dirty"] = False; editor_record["signature"] = self._cursor_file_signature(path)
+                self.cursor_symbol_cache.pop(str(path.resolve()), None)
+                self._refresh_cursor_editor_title(editor_record); self._update_cursor_line_numbers(editor_record); self._highlight_cursor_editor(str(path.resolve()))
             self.index.refresh_path(path)
             messagebox.showinfo(APP_NAME, f"Изменения сохранены. Резервная копия:\n{backup}")
             window.destroy(); self._refresh_results()
