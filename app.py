@@ -507,7 +507,7 @@ def local_chat(models_dir: str | Path, model: str, messages: list[dict], timeout
         log_event(f"CUDA_DEVICE_ERROR model={model!r} exit={device_check.returncode} detail={detail!r}")
         raise RuntimeError("CUDA-видеокарта не обнаружена встроенным движком. Проверьте драйвер NVIDIA и журнал приложения.\n" + detail)
     cuda_device = cuda_match.group(1)
-    log_event(f"CUDA_DEVICE_SELECTED name={cuda_device} devices={device_check.stdout.strip()!r} gpu_layers=all context_tokens=32768 kv_cache=q8_0")
+    log_event(f"CUDA_DEVICE_SELECTED name={cuda_device} devices={device_check.stdout.strip()!r} gpu_layers=all context_tokens=65536 kv_cache=q4_0 rope_scaling=yarn scale=2 orig_ctx=32768")
     system = next((str(item.get("content", "")) for item in compacted_messages if item.get("role") == "system"), "Отвечай на языке пользователя.")
     turns = [item for item in compacted_messages if item.get("role") != "system"]
     prompt = "\n\n".join(("Пользователь" if item.get("role") == "user" else "Ассистент") + ":\n" + str(item.get("content", "")) for item in turns)
@@ -520,9 +520,10 @@ def local_chat(models_dir: str | Path, model: str, messages: list[dict], timeout
             temp = Path(temp_dir); prompt_file = temp / "prompt.txt"; system_file = temp / "system.txt"
             prompt_file.write_text(prompt, encoding="utf-8"); system_file.write_text(system, encoding="utf-8")
             command = [str(executable), "-m", str(model_path), "-f", str(prompt_file), "--system-prompt-file", str(system_file),
-                       "-n", "2048", "-dev", cuda_device, "-ngl", "999", "-c", "32768",
-                       "-ctk", "q8_0", "-ctv", "q8_0", "-fa", "on", "--batch-size", "512",
-                       "--simple-io", "--single-turn", "--no-display-prompt"]
+                       "-n", "2048", "-dev", cuda_device, "-ngl", "999", "-c", "65536",
+                       "--rope-scaling", "yarn", "--rope-scale", "2", "--yarn-orig-ctx", "32768",
+                       "-ctk", "q4_0", "-ctv", "q4_0", "-fa", "on", "--batch-size", "512",
+                       "--simple-io", "--single-turn", "--no-display-prompt", "--log-disable"]
             try:
                 result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
                                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), env=runtime_environment())
@@ -549,7 +550,7 @@ def local_chat(models_dir: str | Path, model: str, messages: list[dict], timeout
         return output
 
 
-def compact_chat_messages(messages: list[dict], max_chars=42000):
+def compact_chat_messages(messages: list[dict], max_chars=90000):
     """Trim old turns to fit the local context window; never silently truncate current content."""
     copied = [dict(message) for message in messages]
     system = next((item for item in copied if item.get("role") == "system"), {"role": "system", "content": ""})
