@@ -6,11 +6,15 @@ The app downloads the official llama.cpp Windows CUDA runtime and its CUDA DLL p
 
 Users can select a folder containing multiple GGUF files, Ollama-style manifest/blob storage, or add several individual GGUF files. The list is persisted in local config. One model is loaded per request, then the CLI exits and frees VRAM. The same model selector is available from Files, Chat, and Cursor tabs.
 
+Every generation must explicitly select an available CUDA device and offload all model layers to the GPU; never silently fall back to CPU. The app verifies devices through llama.cpp --list-devices. The default context is 32,768 tokens with Q8 KV cache and Flash Attention. Local diagnostics are stored at %APPDATA%\LocalFileManager\app.log; logs may include model paths, timings, CUDA device details, and errors, but must never contain prompts or indexed file contents. Show a visible busy indicator during model loading/generation.
+
 ## File indexing and chat
 
 The user explicitly chooses folders to index. The index is stored in `%APPDATA%\LocalFileManager`; it contains extracted text and metadata while source files remain in place. Chat history and attachments stay local. Natural-language file-finding requests query the local index; only indexed folders are searched.
 
 The **Files and Search** tab includes its own chat pane. It shares the current chat list, selected local model, mode, working folder, and attachments with the other tabs. A selected search result is added as local prompt context; natural-language find requests query the local index directly. File edits must use the existing reviewed diff flow and explicit user approval.
+
+Detect Russian file-search requests typed with an English keyboard layout and route them to the local index without sending chat history to the model. Keep request history within the model context window by dropping oldest turns; never silently truncate the current request or attached content. If the current file plus request cannot fit, show a clear explanation. Surface model errors in the transcript and write technical diagnostics to the local app log.
 
 ## Cursor workspace
 
@@ -22,4 +26,4 @@ Never add a delete operation. Organization suggestions are proposals; moves and 
 
 ## Checks
 
-After changing the app, verify syntax and content search, then exercise the visible chat, saved chat list, goal/Cursor modes, source preview, attachments, save-as, and text/DOCX/Excel edit previews using temporary files. Launch through the desktop shortcut and confirm a local model response. Review filesystem operations to ensure the model cannot delete files; never use real user documents for smoke edits.
+After changing the app, verify syntax and content search, then exercise visible chat from Files, Chat, and Cursor, saved chat list, goal mode, source preview, attachments, save-as, context trimming, and text/DOCX/Excel edit previews using temporary files. Launch through the desktop shortcut and confirm a real response from an explicitly selected CUDA device. Confirm errors and CUDA diagnostics are written to the local app log without prompt or document contents. Review filesystem operations to ensure the model cannot delete files; never use real user documents for smoke edits.

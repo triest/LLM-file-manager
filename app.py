@@ -6,6 +6,8 @@ import base64
 import difflib
 import io
 import keyword
+import logging
+from logging.handlers import RotatingFileHandler
 import math
 import os
 import queue
@@ -37,6 +39,7 @@ CUDA_RUNTIME_URL = "https://github.com/ggml-org/llama.cpp/releases/download/b127
 CUDA_RUNTIME_DIR = Path(os.environ.get("APPDATA", Path.home())) / "LocalFileManager" / "runtime" / "llama-cpp-b12755"
 _INFERENCE_LOCK = threading.RLock()
 _LOADED_MODEL = {"path": None, "runtime": None, "gpu": False}
+_APP_LOGGER = None
 EDITABLE_TEXT = {".txt", ".md", ".rst", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".py", ".js", ".ts", ".css", ".log", ".ini", ".yaml", ".yml", ".toml", ".sql", ".sh", ".ps1", ".bat", ".cs", ".java", ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".jsx", ".tsx", ".vue", ".svelte", ".php", ".rb", ".swift", ".kt", ".properties", ".env"}
 LANGUAGE_NAMES = {".py": "Python", ".php": "PHP", ".js": "JavaScript", ".jsx": "JavaScript JSX", ".ts": "TypeScript", ".tsx": "TypeScript JSX", ".vue": "Vue", ".svelte": "Svelte", ".html": "HTML", ".htm": "HTML", ".css": "CSS", ".scss": "SCSS", ".sql": "SQL", ".java": "Java", ".cs": "C#", ".go": "Go", ".rs": "Rust", ".c": "C", ".h": "C header", ".cpp": "C++", ".hpp": "C++ header", ".rb": "Ruby", ".swift": "Swift", ".kt": "Kotlin", ".sh": "Shell", ".ps1": "PowerShell", ".json": "JSON", ".xml": "XML", ".yaml": "YAML", ".yml": "YAML", ".toml": "TOML"}
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -46,6 +49,25 @@ def app_data() -> Path:
     root = Path(os.environ.get("APPDATA", Path.home())) / "LocalFileManager"
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def app_logger():
+    global _APP_LOGGER
+    if _APP_LOGGER is None:
+        logger = logging.getLogger("local_file_manager")
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        if not logger.handlers:
+            handler = RotatingFileHandler(app_data() / "app.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+            handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            logger.addHandler(handler)
+        _APP_LOGGER = logger
+    return _APP_LOGGER
+
+
+def log_event(message: str, *, exc_info=False):
+    try: app_logger().info(message, exc_info=exc_info)
+    except OSError: pass
 
 
 def read_config() -> dict:
@@ -302,11 +324,17 @@ def extract_file_search_query(prompt: str):
     """Recognize a natural-language request to find a local file and retain identifying terms."""
     lowered = prompt.casefold()
     intents = ("найди", "найти", "поищи", "отыщи", "где лежит", "где находится", "где найти")
+    if not any(word in lowered for word in intents):
+        # Users sometimes type Russian while the keyboard is still in English layout.
+        en = "qwertyuiop[]asdfghjkl;'zxcvbnm,."
+        ru = "йцукенгшщзхъфывапролджэячсмитьбю"
+        translated = lowered.translate(str.maketrans(en, ru))
+        if any(word in translated for word in intents): lowered = translated
     if not any(word in lowered for word in intents): return None
     local_file_context = ("комп" in lowered or "диск" in lowered or "папк" in lowered or "файл" in lowered or
                           "документ" in lowered or "где лежит" in lowered or "где находится" in lowered)
     if not local_file_context: return None
-    stop = {"найди", "найти", "поищи", "отыщи", "где", "лежит", "находится", "у", "меня", "на", "в", "во", "по", "про", "для", "из", "с", "от", "моем", "моём", "компе", "компьютере", "диске", "где-то", "гдето", "пожалуйста", "мне", "его", "ее", "её", "тот", "этот", "и", "или", "моя", "моей", "мой", "мое", "моё"}
+    stop = {"найди", "найти", "поищи", "отыщи", "где", "лежит", "находится", "у", "меня", "на", "в", "во", "по", "про", "для", "из", "с", "от", "там", "файл", "файлы", "документ", "документы", "моем", "моём", "компе", "компьютере", "диске", "где-то", "гдето", "пожалуйста", "мне", "его", "ее", "её", "тот", "этот", "и", "или", "моя", "моей", "мой", "мое", "моё"}
     terms = [word for word in re.findall(r"[\w.-]+", lowered, flags=re.UNICODE) if len(word) > 1 and word not in stop]
     return terms or []
 
@@ -387,7 +415,7 @@ class Index:
 
     def find_relevant(self, terms: list[str], limit=10):
         if not terms: return []
-        terms = list(dict.fromkeys(search_fold(term) for term in terms))[:12]
+        terms = list(dict.fromkeys(search_word_stem(term) for term in terms))[:12]
         clauses = " OR ".join(["(CASEFOLD(name) LIKE ? OR CASEFOLD(body) LIKE ? OR CASEFOLD(path) LIKE ?)"] * len(terms))
         args = [value for term in terms for value in (f"%{term}%", f"%{term}%", f"%{term}%")]
         with self.lock:
@@ -470,25 +498,42 @@ def local_chat(models_dir: str | Path, model: str, messages: list[dict], timeout
     model_path = resolve_model_path(models_dir, model)
     if any(message.get("_image_paths") for message in messages):
         raise ValueError("Для вложенных изображений выберите модель и формат, поддерживаемые встроенным GGUF-движком.")
-    system = next((str(item.get("content", "")) for item in messages if item.get("role") == "system"), "Отвечай на языке пользователя.")
-    turns = [item for item in messages if item.get("role") != "system"]
+    compacted_messages, original_chars, sent_chars = compact_chat_messages(messages)
+    device_check = subprocess.run([str(executable), "--list-devices"], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                  timeout=20, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), env=runtime_environment())
+    cuda_match = re.search(r"^\s*(CUDA\d+):", device_check.stdout, re.MULTILINE)
+    if device_check.returncode != 0 or not cuda_match:
+        detail = (device_check.stderr or device_check.stdout or "llama.cpp не обнаружил CUDA-устройство")[-1200:]
+        log_event(f"CUDA_DEVICE_ERROR model={model!r} exit={device_check.returncode} detail={detail!r}")
+        raise RuntimeError("CUDA-видеокарта не обнаружена встроенным движком. Проверьте драйвер NVIDIA и журнал приложения.\n" + detail)
+    cuda_device = cuda_match.group(1)
+    log_event(f"CUDA_DEVICE_SELECTED name={cuda_device} devices={device_check.stdout.strip()!r} gpu_layers=all context_tokens=32768 kv_cache=q8_0")
+    system = next((str(item.get("content", "")) for item in compacted_messages if item.get("role") == "system"), "Отвечай на языке пользователя.")
+    turns = [item for item in compacted_messages if item.get("role") != "system"]
     prompt = "\n\n".join(("Пользователь" if item.get("role") == "user" else "Ассистент") + ":\n" + str(item.get("content", "")) for item in turns)
     if not prompt: raise ValueError("В сообщении нет текста для модели.")
+    log_event(f"LLM_REQUEST_START model={model!r} model_path={str(model_path)!r} device={cuda_device} prompt_chars={len(prompt)} system_chars={len(system)} context_chars={original_chars}->{sent_chars}")
+    started = time.monotonic()
     with _INFERENCE_LOCK:
         runtime_root = app_data() / "runtime_requests"; runtime_root.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="request_", dir=runtime_root) as temp_dir:
             temp = Path(temp_dir); prompt_file = temp / "prompt.txt"; system_file = temp / "system.txt"
             prompt_file.write_text(prompt, encoding="utf-8"); system_file.write_text(system, encoding="utf-8")
             command = [str(executable), "-m", str(model_path), "-f", str(prompt_file), "--system-prompt-file", str(system_file),
-                       "-n", "2048", "-ngl", "99", "-c", "8192", "--batch-size", "512",
-                       "--simple-io", "--single-turn", "--no-display-prompt", "--log-disable"]
+                       "-n", "2048", "-dev", cuda_device, "-ngl", "999", "-c", "32768",
+                       "-ctk", "q8_0", "-ctv", "q8_0", "-fa", "on", "--batch-size", "512",
+                       "--simple-io", "--single-turn", "--no-display-prompt"]
             try:
                 result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
                                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), env=runtime_environment())
             except subprocess.TimeoutExpired as error:
+                log_event(f"LLM_REQUEST_TIMEOUT model={model!r} device={cuda_device} seconds={timeout}")
                 raise TimeoutError(f"Локальная модель не завершила ответ за {timeout} секунд.") from error
+        diagnostics = "\n".join(line.strip() for line in result.stderr.splitlines() if line.strip())[-5000:]
+        if diagnostics: log_event(f"LLM_RUNTIME_DIAGNOSTICS model={model!r} device={cuda_device}\n{diagnostics}")
         if result.returncode:
             detail = (result.stderr or result.stdout)[-2000:]
+            log_event(f"LLM_REQUEST_ERROR model={model!r} device={cuda_device} exit={result.returncode} detail={detail!r}")
             raise RuntimeError(f"llama.cpp завершился с кодом {result.returncode}:\n{detail}")
         output = result.stdout
         input_marker = "\n> " + prompt + "\n"
@@ -496,9 +541,38 @@ def local_chat(models_dir: str | Path, model: str, messages: list[dict], timeout
         if marker_at >= 0: output = output[marker_at + len(input_marker):]
         if "\n[ Prompt:" in output: output = output.split("\n[ Prompt:", 1)[0]
         output = output.split("\nExiting...", 1)[0].strip()
-        if not output: raise RuntimeError("Локальная модель вернула пустой ответ.")
-        _LOADED_MODEL.update({"path": str(model_path), "runtime": None, "gpu": True})
+        if not output:
+            log_event(f"LLM_REQUEST_EMPTY model={model!r} device={cuda_device}")
+            raise RuntimeError("Локальная модель вернула пустой ответ.")
+        _LOADED_MODEL.update({"path": str(model_path), "runtime": cuda_device, "gpu": True})
+        log_event(f"LLM_REQUEST_OK model={model!r} device={cuda_device} elapsed_seconds={time.monotonic()-started:.1f}")
         return output
+
+
+def compact_chat_messages(messages: list[dict], max_chars=42000):
+    """Trim old turns to fit the local context window; never silently truncate current content."""
+    copied = [dict(message) for message in messages]
+    system = next((item for item in copied if item.get("role") == "system"), {"role": "system", "content": ""})
+    turns = [item for item in copied if item.get("role") != "system"]
+    original_chars = len(str(system.get("content", ""))) + sum(len(str(item.get("content", ""))) for item in turns)
+    if not turns: raise ValueError("В запросе нет сообщения пользователя.")
+    newest = turns[-1]
+    required = len(str(system.get("content", ""))) + len(str(newest.get("content", "")))
+    if required > max_chars:
+        raise ValueError(f"Текущий запрос вместе с выбранным файлом занимает {required:,} символов, это больше безопасного лимита контекста ({max_chars:,}). Выберите более короткий файл или разделите задачу на части.")
+    kept = [newest]
+    budget = max_chars - required
+    for message in reversed(turns[:-1]):
+        cost = len(str(message.get("content", "")))
+        if cost + 2 > budget: break
+        kept.insert(0, message); budget -= cost + 2
+    omitted = len(turns) - len(kept)
+    if omitted:
+        system = dict(system)
+        system["content"] = str(system.get("content", "")) + f"\n\nДля ограничения контекста пропущены {omitted} самых старых сообщений переписки."
+    compacted = [system] + kept
+    sent_chars = len(str(system.get("content", ""))) + sum(len(str(item.get("content", ""))) for item in kept)
+    return compacted, original_chars, sent_chars
 
 
 def install_inference_runtime() -> tuple[bool, str]:
@@ -564,6 +638,15 @@ def human_size(size):
 
 def search_fold(value):
     return str(value or "").casefold().replace("ё", "е")
+
+
+def search_word_stem(value):
+    """Apply a small suffix stemmer so Russian case endings still match file content."""
+    word = search_fold(value)
+    for suffix in ("иями", "ями", "ами", "ого", "его", "ыми", "ими", "ому", "ему", "иях", "ах", "ях", "ов", "ев", "ей", "ам", "ям", "ом", "ем", "ой", "ый", "ий", "ые", "ие", "ая", "яя", "ое", "ее", "ую", "юю", "а", "я", "ы", "и", "у", "ю", "е", "о"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 4:
+            return word[:-len(suffix)]
+    return word
 
 
 def rounded_points(width, height, radius):
@@ -660,6 +743,7 @@ class RoundedButton(tk.Canvas):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        log_event("APPLICATION_START")
         self._configure_styles()
         self.title(APP_NAME); self.geometry("1180x760"); self.minsize(900, 600)
         self.config_data = read_config(); self.index = Index(); self.events = queue.Queue(); self.rows = []
@@ -731,6 +815,7 @@ class App(tk.Tk):
         RoundedButton(bar, text="Добавить папку", command=self.add_folder, style="Topbar.TButton").grid(row=0, column=3, padx=3)
         RoundedButton(bar, text="Убрать", command=self.remove_folder, style="Topbar.TButton").grid(row=0, column=4, padx=3)
         RoundedButton(bar, text="Сканировать", command=self.scan, style="Accent.TButton").grid(row=0, column=5, padx=(4, 0))
+        RoundedButton(bar, text="Журнал", command=self.open_app_log, style="Topbar.TButton").grid(row=0, column=6, padx=(5, 0))
         self.main_notebook = ttk.Notebook(self); self.main_notebook.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0,10))
         self.files_tab = ttk.Frame(self.main_notebook); self.chat_tab = ttk.Frame(self.main_notebook); self.cursor_tab = ttk.Frame(self.main_notebook)
         self.main_notebook.add(self.files_tab, text="Файлы и поиск")
@@ -766,7 +851,11 @@ class App(tk.Tk):
         ttk.Label(right, text="Модель запускается внутри приложения; отдельный сервер не нужен.", wraplength=370).grid(row=5, column=0, sticky="w", pady=5)
         files_chat = ttk.Frame(body, padding=8); body.add(files_chat, weight=3)
         self._build_files_chat_ui(files_chat)
-        self.status = tk.StringVar(value="Добавьте папку и нажмите «Сканировать»."); ttk.Label(self, textvariable=self.status, style="Status.TLabel", anchor="w").grid(row=2, column=0, sticky="ew")
+        self.status = tk.StringVar(value="Добавьте папку и нажмите «Сканировать».")
+        status_bar = ttk.Frame(self); status_bar.grid(row=2, column=0, sticky="ew"); status_bar.columnconfigure(0, weight=1)
+        ttk.Label(status_bar, textvariable=self.status, style="Status.TLabel", anchor="w").grid(row=0, column=0, sticky="ew")
+        self.llm_progress = ttk.Progressbar(status_bar, mode="indeterminate", length=150)
+        self.llm_progress.grid(row=0, column=1, sticky="e", padx=12); self.llm_progress.grid_remove()
         self._build_chat_ui(self.chat_tab)
         self._build_cursor_tab()
         self.main_notebook.bind("<<NotebookTabChanged>>", self._main_tab_changed)
@@ -816,6 +905,11 @@ class App(tk.Tk):
         self._refresh_files_chat_selector()
 
     def _refresh_folders(self): self.folder_var.set("; ".join(self.config_data["folders"]) or "Папки не выбраны")
+    def open_app_log(self):
+        path = app_data() / "app.log"
+        if not path.exists(): path.write_text("Журнал Local File Manager\n", encoding="utf-8")
+        try: os.startfile(path)
+        except (AttributeError, OSError) as e: messagebox.showerror(APP_NAME, f"Не удалось открыть журнал:\n{e}\n\n{path}")
     def _model_changed(self, _event=None):
         self.config_data.update({"model": self.model.get(), "model_dir": self.model_dir_var.get()})
         write_config(self.config_data)
@@ -933,7 +1027,8 @@ class App(tk.Tk):
             self._render_chat()
         self._sync_chat_controls()
     def _sync_chat_controls(self):
-        enabled = not self.chat_busy
+        llm_busy = self.chat_busy or getattr(self, "cursor_completion_busy", False) or getattr(self, "legacy_ai_busy", False)
+        enabled = not llm_busy
         for name in ("main_chat_send_button", "cursor_chat_send_button", "files_chat_send_button",
                      "main_chat_edit_button", "cursor_chat_edit_button", "files_chat_edit_button"):
             button = getattr(self, name, None)
@@ -943,6 +1038,12 @@ class App(tk.Tk):
             button = getattr(self, name, None)
             if button is not None:
                 button.configure(state="normal" if self.last_assistant_answer else "disabled")
+        progress = getattr(self, "llm_progress", None)
+        if progress is not None:
+            if llm_busy:
+                progress.grid(); progress.start(12)
+            else:
+                progress.stop(); progress.grid_remove()
     def _refresh_files_chat_selector(self):
         if not hasattr(self, "files_chat_box"): return
         ordered = sorted(self.chats, key=lambda chat: chat.get("updated", 0), reverse=True)
@@ -1227,16 +1328,20 @@ class App(tk.Tk):
         model = self.model.get().strip(); self.cursor_completion_busy = True
         self.cursor_completion_button.configure(state="disabled")
         self.cursor_editor_status.set(f"Локальная модель предлагает {language}…")
+        log_event(f"CURSOR_COMPLETION_START model={model!r} file_ext={record['path'].suffix.lower()}")
+        self._sync_chat_controls()
         def work():
             try:
                 answer = local_chat(self.model_dir_var.get(), model, [{"role": "user", "content": prompt}])
                 if not answer or not answer.strip(): raise ValueError("Модель вернула пустое дополнение")
                 self.after(0, lambda: self._show_cursor_completion(record, marker, answer))
             except Exception as e:
+                log_event(f"CURSOR_COMPLETION_ERROR model={model!r} error={str(e)!r}", exc_info=True)
                 self.after(0, lambda error=str(e): self._cursor_completion_error(record, marker, error))
         threading.Thread(target=work, daemon=True).start()
     def _cursor_completion_error(self, record, marker, error):
         self.cursor_completion_busy = False; self.cursor_completion_button.configure(state="normal")
+        self._sync_chat_controls()
         self.cursor_editor_status.set("LLM-вставка не получена")
         if record and record["editor"].winfo_exists():
             for suffix in ("_start", "_end"):
@@ -1245,6 +1350,7 @@ class App(tk.Tk):
         messagebox.showerror("Локальная модель недоступна", error)
     def _show_cursor_completion(self, record, marker, answer):
         self.cursor_completion_busy = False; self.cursor_completion_button.configure(state="normal")
+        self._sync_chat_controls()
         code = answer.rstrip("\r\n")
         if code.lstrip().startswith("```") and code.rstrip().endswith("```"):
             fenced = code.lstrip().split("\n", 1)
@@ -1754,15 +1860,24 @@ class App(tk.Tk):
     def _ai(self, prompt):
         model = self.model.get().strip()
         self.config_data.update({"model": model, "model_dir": self.model_dir_var.get()}); write_config(self.config_data)
-        self.status.set("ИИ обрабатывает запрос локально…")
+        self.status.set("Локальная модель загружается и отвечает на CUDA…")
+        self.legacy_ai_busy = True; self._sync_chat_controls()
+        log_event(f"LEGACY_AI_REQUEST_START model={model!r} prompt_chars={len(prompt)}")
         def work():
             try:
                 answer = local_chat(self.model_dir_var.get(), model, [{"role": "user", "content": prompt}]) or "Пустой ответ"
-                self.after(0, lambda: self._answer(answer))
+                self.after(0, lambda: self._legacy_ai_done(answer))
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Локальная модель недоступна", f"{e}\n\nПроверьте локальный адрес, выбранную модель и её запуск."))
+                log_event(f"LEGACY_AI_REQUEST_ERROR model={model!r} error={str(e)!r}", exc_info=True)
+                self.after(0, lambda error=str(e): self._legacy_ai_error(error))
             self.events.put("Готово")
         threading.Thread(target=work, daemon=True).start()
+    def _legacy_ai_done(self, answer):
+        self.legacy_ai_busy = False; self._sync_chat_controls(); self._answer(answer)
+    def _legacy_ai_error(self, error):
+        self.legacy_ai_busy = False; self._sync_chat_controls()
+        self.status.set("Модель не ответила — подробности в журнале")
+        messagebox.showerror("Локальная модель недоступна", f"{error}\n\nЖурнал диагностики: {app_data() / 'app.log'}")
     def open_chat(self):
         self.main_notebook.select(self.chat_tab)
         self.chat_input.focus_set()
@@ -2333,13 +2448,15 @@ class App(tk.Tk):
         self.chat_busy = True; self._sync_chat_controls()
         model = self.model.get().strip()
         self.config_data.update({"model": model, "model_dir": self.model_dir_var.get()}); write_config(self.config_data)
-        self.status.set(f"Запрос к локальной модели {model}…")
+        self.status.set(f"Модель {model} загружается и отвечает на CUDA…")
+        log_event(f"UI_REQUEST_QUEUED model={model!r} purpose={purpose} messages={len(messages)}")
         def work():
             try:
                 answer = local_chat(self.model_dir_var.get(), model, messages)
                 if not answer: raise ValueError("Модель вернула пустой ответ")
                 self.after(0, lambda a=answer: self._chat_done(a, purpose, edit_path, original, edit_kind, edit_encoding))
             except Exception as e:
+                log_event(f"UI_REQUEST_FAILED model={model!r} purpose={purpose} error={str(e)!r}", exc_info=True)
                 self.after(0, lambda error=str(e): self._chat_error(error))
         threading.Thread(target=work, daemon=True).start()
 
@@ -2389,8 +2506,11 @@ class App(tk.Tk):
     def _chat_error(self, error):
         self.chat_busy = False
         self._sync_chat_controls()
-        self.status.set("Не удалось получить ответ")
-        messagebox.showerror("Локальная модель недоступна", f"{error}\n\nПроверьте выбранную GGUF-модель и журнал установки встроенного движка.")
+        self.status.set("Модель не ответила — подробности в журнале")
+        log_event(f"CHAT_VISIBLE_ERROR error={error!r}")
+        self.chat_history.append({"role": "assistant", "content": f"Ошибка локальной модели:\n{error}\n\nДиагностика записана в журнал приложения."})
+        self._render_chat(); self._save_current_chat()
+        messagebox.showerror("Локальная модель недоступна", f"{error}\n\nЖурнал диагностики: {app_data() / 'app.log'}")
 
     def _show_edit_preview(self, path, original, edited, edit_kind, edit_encoding="utf-8"):
         win = tk.Toplevel(self); win.title(f"Проверка правок — {path.name}"); win.geometry("1000x680"); win.columnconfigure(0, weight=1); win.rowconfigure(1, weight=1)
