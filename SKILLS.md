@@ -1,19 +1,23 @@
 # App capabilities and operating notes
 
-## File indexing
+## Local model runtime
 
-The user explicitly chooses the folders to index. The index is stored in `%APPDATA%\LocalFileManager`; it contains extracted text and file metadata, while source files stay in place. Large files and common system/build folders are skipped.
+The app downloads the official llama.cpp Windows CUDA runtime and its CUDA DLL packages on first launch, then invokes its `llama-cli` process invisibly for each request. It does not connect to Ollama, LM Studio, a model server, or a cloud API. The one-time runtime download is about 750 MB. Installation output is written to `%APPDATA%\LocalFileManager\engine_install.log`.
 
-## Local model connection
+Users can select a folder containing multiple GGUF files, Ollama-style manifest/blob storage, or add several individual GGUF files. The list is persisted in local config. One model is loaded per request, then the CLI exits and frees VRAM. The same model selector is available from Files, Chat, and Cursor tabs.
 
-The main window opens on the chat tab and keeps a local chat list. Chats can use normal, goal, or Cursor project mode. The working folder is per chat. Attachments and conversation content are persisted locally in `%APPDATA%\LocalFileManager\chats.json`.
+## File indexing and chat
 
-The app connects to a local Ollama service at `127.0.0.1:11434` or LM Studio's OpenAI-compatible API, usually `http://127.0.0.1:1234/v1`. On startup it tries Ollama and may launch the installed service without opening a console. File contents are sent only to the selected localhost model when the user asks for an AI operation. Natural language file-finding requests query the local index directly; search reads only indexed folders.
+The user explicitly chooses folders to index. The index is stored in `%APPDATA%\LocalFileManager`; it contains extracted text and metadata while source files remain in place. Chat history and attachments stay local. Natural-language file-finding requests query the local index; only indexed folders are searched.
 
-## Organization and office files
+## Cursor workspace
 
-Organization suggestions do not modify files. The user selects a file and invokes a move or rename action separately. No delete operation exists, and the model has no file-system tools. Text and source-code edits show a diff first; replacing the source requires explicit confirmation and a timestamped backup. DOCX edits are limited to selected paragraph text and retain the rest of the Office package. Excel files can receive validated, cell-addressed changes from a model plan; show old and new values before writing an output copy. Replacing XLSX/XLSM requires confirmation and a timestamped backup. XLS/XLSB output is converted to a new XLSX file.
+Cursor is a separate main-window tab. The user selects a working folder, browses its files, previews one file, chooses a model, and enters a task. The task is handed to the chat workflow with the selected file as context. Text/document changes show a review preview and require explicit confirmation before saving. The model cannot directly access the project filesystem or run code.
+
+## Safety and office files
+
+Never add a delete operation. Organization suggestions are proposals; moves and renames require user actions. Text and source edits show a diff first; replacing a source requires explicit confirmation and a timestamped backup. DOCX changes retain unrelated document content. Excel edits are validated cell-addressed operations and are reviewed before writing an output copy. XLS/XLSB outputs become a new XLSX file. Optional document parsers fail gracefully when unavailable.
 
 ## Checks
 
-After changing the app, verify syntax and content search, then exercise the visible chat, saved chat list, goal/Cursor modes, source preview, attachments, save-as, and text/DOCX/Excel edit previews using temporary files. Launch through the desktop shortcut and confirm the local model returns a response. Review filesystem operations to ensure the model still has no way to delete files; do not use real user documents for smoke edits.
+After changing the app, verify syntax and content search, then exercise the visible chat, saved chat list, goal/Cursor modes, source preview, attachments, save-as, and text/DOCX/Excel edit previews using temporary files. Launch through the desktop shortcut and confirm a local model response. Review filesystem operations to ensure the model cannot delete files; never use real user documents for smoke edits.

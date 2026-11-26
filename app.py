@@ -4,19 +4,20 @@ from __future__ import annotations
 import json
 import base64
 import difflib
+import math
 import os
 import queue
 import re
 import shutil
+import site
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
-import uuid
-import urllib.error
+import tempfile
 import urllib.request
-from urllib.parse import urlparse
+import uuid
 import zipfile
 from datetime import datetime
 from html.parser import HTMLParser
@@ -29,7 +30,10 @@ APP_NAME = "Локальный файловый менеджер"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 SUPPORTED = {".txt", ".md", ".rst", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".py", ".js", ".ts", ".css", ".log", ".ini", ".yaml", ".yml", ".toml", ".rtf", ".docx", ".xlsx", ".xlsm", ".xls", ".xlsb", ".pptx", ".odt", ".ods", ".odp", ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".sql", ".sh", ".ps1", ".bat", ".cs", ".java", ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".jsx", ".tsx", ".vue", ".svelte", ".php", ".rb", ".swift", ".kt", ".properties", ".env"}
 MAX_TEXT = 500_000
-OLLAMA_URL = "http://127.0.0.1:11434"
+CUDA_RUNTIME_URL = "https://github.com/ggml-org/llama.cpp/releases/download/b12755/llama-b12755-bin-win-cuda-12.4-x64.zip"
+CUDA_RUNTIME_DIR = Path(os.environ.get("APPDATA", Path.home())) / "LocalFileManager" / "runtime" / "llama-cpp-b12755"
+_INFERENCE_LOCK = threading.RLock()
+_LOADED_MODEL = {"path": None, "runtime": None, "gpu": False}
 EDITABLE_TEXT = {".txt", ".md", ".rst", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".py", ".js", ".ts", ".css", ".log", ".ini", ".yaml", ".yml", ".toml", ".sql", ".sh", ".ps1", ".bat", ".cs", ".java", ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".jsx", ".tsx", ".vue", ".svelte", ".php", ".rb", ".swift", ".kt", ".properties", ".env"}
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
@@ -45,7 +49,7 @@ def read_config() -> dict:
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {"folders": [], "model": "qwen2.5:7b", "provider": "Ollama", "endpoint": OLLAMA_URL}
+        return {"folders": [], "model": "qwen2.5:7b", "model_dir": str(Path("J:/OllamaModels"))}
 
 
 def write_config(config: dict) -> None:
@@ -412,58 +416,139 @@ class Index:
                 self.db.execute("INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?)", (p, new.name, new.suffix.lower(), st.st_size, st.st_mtime, body))
 
 
-def _local_url(endpoint: str, suffix: str) -> str:
-    parsed = urlparse(endpoint.strip())
-    if parsed.scheme not in {"http", "https"} or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
-        raise ValueError("Для приватности можно подключать только сервисы на этом компьютере (localhost).")
-    return endpoint.rstrip("/") + suffix
+def discover_model_files(models_dir: str | Path) -> dict[str, Path]:
+    """Read GGUF model paths from model manifests or a plain folder of GGUF files."""
+    root = Path(models_dir).expanduser()
+    found = {}
+    if root.is_file() and root.suffix.lower() == ".gguf": return {root.stem: root.resolve()}
+    manifest_root = root / "manifests"
+    if manifest_root.is_dir():
+        for manifest_path in manifest_root.rglob("*"):
+            if not manifest_path.is_file(): continue
+            try: manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError): continue
+            model_layer = next((layer for layer in manifest.get("layers", []) if layer.get("mediaType") == "application/vnd.ollama.image.model"), None)
+            if not model_layer: continue
+            digest = str(model_layer.get("digest", ""))
+            if not digest.startswith("sha256:"): continue
+            blob = root / "blobs" / ("sha256-" + digest.split(":", 1)[1])
+            if not blob.is_file(): continue
+            try: relative = manifest_path.relative_to(manifest_root).parts
+            except ValueError: continue
+            if len(relative) >= 3:
+                label = "/".join(relative[2:-1]) + ":" + relative[-1]
+                found[label] = blob.resolve()
+    if root.is_dir():
+        for model_path in root.rglob("*.gguf"):
+            if model_path.is_file(): found.setdefault(model_path.stem, model_path.resolve())
+    return dict(sorted(found.items(), key=lambda item: item[0].casefold()))
 
 
-def local_model_names(provider: str, endpoint: str):
-    path = "/api/tags" if provider == "Ollama" else "/models"
-    with urllib.request.urlopen(_local_url(endpoint, path), timeout=3) as r: payload = json.loads(r.read())
-    return [m["name"] for m in payload.get("models", [])] if provider == "Ollama" else [m["id"] for m in payload.get("data", [])]
-
-
-def local_chat(provider: str, endpoint: str, model: str, messages: list[dict], timeout=180):
-    path = "/api/chat" if provider == "Ollama" else "/chat/completions"
-    prepared = []
-    for message in messages:
-        item = {key: value for key, value in message.items() if key != "_image_paths"}
-        image_paths = message.get("_image_paths", [])
-        if image_paths:
-            if provider == "Ollama":
-                item["images"] = [base64.b64encode(Path(image_path).read_bytes()).decode("ascii") for image_path in image_paths]
-            else:
-                parts = [{"type": "text", "text": str(item.get("content", ""))}]
-                for image_path in image_paths:
-                    mime = "image/jpeg" if Path(image_path).suffix.lower() in {".jpg", ".jpeg"} else "image/" + Path(image_path).suffix.lower().lstrip(".")
-                    encoded = base64.b64encode(Path(image_path).read_bytes()).decode("ascii")
-                    parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}})
-                item["content"] = parts
-        prepared.append(item)
-    payload = {"model": model, "messages": prepared, "stream": False}
-    req = urllib.request.Request(_local_url(endpoint, path), data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r: result = json.loads(r.read())
-    return result.get("message", {}).get("content") if provider == "Ollama" else result["choices"][0]["message"]["content"]
-
-
-def ollama_tags():
-    return local_model_names("Ollama", OLLAMA_URL)
-
-
-def try_start_ollama():
-    candidates = [shutil.which("ollama"), r"C:\Program Files\Ollama\ollama.exe", str(Path.home() / "AppData/Local/Programs/Ollama/ollama.exe")]
-    exe = next((c for c in candidates if c and Path(c).is_file()), None)
-    if not exe: return False
-    env = os.environ.copy()
-    # Use the already downloaded model store found on this machine.
-    if (Path("J:/OllamaModels/manifests")).is_dir(): env.setdefault("OLLAMA_MODELS", "J:/OllamaModels")
+def resolve_model_path(models_dir: str | Path, model: str) -> Path:
+    root = Path(models_dir).expanduser()
+    direct = Path(model).expanduser()
+    if direct.is_file() and direct.suffix.lower() == ".gguf": return direct.resolve()
+    catalog = discover_model_files(root)
+    if model in catalog: return catalog[model]
     try:
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        subprocess.Popen([exe, "serve"], env=env, creationflags=flags, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
-    except OSError: return False
+        saved = json.loads((app_data() / "config.json").read_text(encoding="utf-8"))
+        for item in saved.get("model_files", []):
+            candidate = Path(item).expanduser()
+            if candidate.is_file() and candidate.suffix.lower() == ".gguf" and candidate.stem == model: return candidate.resolve()
+    except (OSError, ValueError, TypeError, AttributeError): pass
+    raise FileNotFoundError(f"Модель «{model}» не найдена в папке:\n{root}\nВыберите папку с файлами GGUF или хранилище моделей с каталогами manifests/blobs.")
+
+
+def local_chat(models_dir: str | Path, model: str, messages: list[dict], timeout=180):
+    executable = runtime_executable()
+    if not executable:
+        raise RuntimeError("Встроенный движок устанавливается автоматически. Подождите минуту и повторите запрос.")
+    model_path = resolve_model_path(models_dir, model)
+    if any(message.get("_image_paths") for message in messages):
+        raise ValueError("Для вложенных изображений выберите модель и формат, поддерживаемые встроенным GGUF-движком.")
+    system = next((str(item.get("content", "")) for item in messages if item.get("role") == "system"), "Отвечай на языке пользователя.")
+    turns = [item for item in messages if item.get("role") != "system"]
+    prompt = "\n\n".join(("Пользователь" if item.get("role") == "user" else "Ассистент") + ":\n" + str(item.get("content", "")) for item in turns)
+    if not prompt: raise ValueError("В сообщении нет текста для модели.")
+    with _INFERENCE_LOCK:
+        runtime_root = app_data() / "runtime_requests"; runtime_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="request_", dir=runtime_root) as temp_dir:
+            temp = Path(temp_dir); prompt_file = temp / "prompt.txt"; system_file = temp / "system.txt"
+            prompt_file.write_text(prompt, encoding="utf-8"); system_file.write_text(system, encoding="utf-8")
+            command = [str(executable), "-m", str(model_path), "-f", str(prompt_file), "--system-prompt-file", str(system_file),
+                       "-n", "2048", "-ngl", "99", "-c", "8192", "--batch-size", "512",
+                       "--simple-io", "--single-turn", "--no-display-prompt", "--log-disable"]
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), env=runtime_environment())
+            except subprocess.TimeoutExpired as error:
+                raise TimeoutError(f"Локальная модель не завершила ответ за {timeout} секунд.") from error
+        if result.returncode:
+            detail = (result.stderr or result.stdout)[-2000:]
+            raise RuntimeError(f"llama.cpp завершился с кодом {result.returncode}:\n{detail}")
+        output = result.stdout
+        input_marker = "\n> " + prompt + "\n"
+        marker_at = output.rfind(input_marker)
+        if marker_at >= 0: output = output[marker_at + len(input_marker):]
+        if "\n[ Prompt:" in output: output = output.split("\n[ Prompt:", 1)[0]
+        output = output.split("\nExiting...", 1)[0].strip()
+        if not output: raise RuntimeError("Локальная модель вернула пустой ответ.")
+        _LOADED_MODEL.update({"path": str(model_path), "runtime": None, "gpu": True})
+        return output
+
+
+def install_inference_runtime() -> tuple[bool, str]:
+    """Download the official llama.cpp CUDA runtime. The app invokes its CLI without a server."""
+    log_path = app_data() / "engine_install.log"
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if runtime_executable(): return True, str(CUDA_RUNTIME_DIR)
+    CUDA_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    download_dir = app_data() / "runtime_downloads"; download_dir.mkdir(parents=True, exist_ok=True)
+    archive = download_dir / "llama-runtime.zip"
+    try:
+        dll_dirs = [Path(package_dir) / "nvidia" for package_dir in site.getsitepackages()]
+        has_cuda_dlls = any((root / "cuda_runtime" / "bin" / "cudart64_12.dll").is_file() and (root / "cublas" / "bin" / "cublas64_12.dll").is_file() for root in dll_dirs)
+        if not has_cuda_dlls:
+            command = [sys.executable, "-m", "pip", "install", "--only-binary=:all:", "nvidia-cuda-runtime-cu12==12.4.127", "nvidia-cublas-cu12==12.4.5.8"]
+            with log_path.open("a", encoding="utf-8") as log:
+                log.write("\\nInstalling CUDA 12.4 runtime libraries\\n")
+                result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, creationflags=creation_flags, timeout=1800)
+            if result.returncode: raise RuntimeError(f"Не удалось поставить CUDA runtime; см. {log_path}")
+        if not archive.exists():
+            with log_path.open("a", encoding="utf-8") as log:
+                log.write("\\nDownloading official llama.cpp b12755 CUDA 12.4 runtime\\n")
+            partial = archive.with_suffix(".part")
+            with urllib.request.urlopen(CUDA_RUNTIME_URL, timeout=60) as response, partial.open("wb") as destination:
+                shutil.copyfileobj(response, destination)
+            partial.replace(archive)
+        with zipfile.ZipFile(archive) as package:
+            base = CUDA_RUNTIME_DIR.resolve()
+            for member in package.infolist():
+                destination = (CUDA_RUNTIME_DIR / member.filename).resolve()
+                if not destination.is_relative_to(base): raise ValueError("Архив runtime содержит небезопасный путь")
+            package.extractall(CUDA_RUNTIME_DIR)
+        if runtime_executable():
+            try: archive.unlink()
+            except OSError: pass
+            return True, str(CUDA_RUNTIME_DIR)
+        return False, f"В архиве не найден llama-cli.exe. Подробности: {log_path}"
+    except (OSError, zipfile.BadZipFile, ValueError, urllib.error.URLError) as error:
+        return False, f"{error}. Подробности: {log_path}"
+
+
+def runtime_executable() -> Path | None:
+    executable = CUDA_RUNTIME_DIR / "llama-cli.exe"
+    return executable if executable.is_file() else None
+
+
+def runtime_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    directories = [str(CUDA_RUNTIME_DIR)]
+    for package_dir in site.getsitepackages():
+        root = Path(package_dir) / "nvidia"
+        if root.is_dir(): directories.extend(str(path) for path in root.glob("**/bin"))
+    env["PATH"] = os.pathsep.join(directories + [env.get("PATH", "")])
+    return env
 
 
 def human_size(size):
@@ -477,14 +562,114 @@ def search_fold(value):
     return str(value or "").casefold().replace("ё", "е")
 
 
+def rounded_points(width, height, radius):
+    points = []
+    for cx, cy, start in ((width-radius, radius, -90), (width-radius, height-radius, 0), (radius, height-radius, 90), (radius, radius, 180)):
+        for step in range(7):
+            angle = math.radians(start + step * 15)
+            points.extend((cx + radius * math.cos(angle), cy + radius * math.sin(angle)))
+    return points
+
+
+def widget_background(master):
+    try: return master.cget("background")
+    except tk.TclError:
+        try:
+            name=master.cget("style") or master.winfo_class()
+            return ttk.Style(master).lookup(name,"background") or "#f7f7f8"
+        except tk.TclError: return "#f7f7f8"
+
+
+class RoundedEntry(tk.Canvas):
+    """Rounded border and inset ttk field, with the familiar Entry API."""
+    def __init__(self, master, **entry_options):
+        super().__init__(master, height=42, background=widget_background(master), bd=0, highlightthickness=0)
+        self.entry = ttk.Entry(self, style="Rounded.TEntry", **entry_options)
+        self.entry_item = self.create_window(12, 8, anchor="nw", window=self.entry, width=300, height=26)
+        super().bind("<Configure>", self._resize)
+        self._draw()
+
+    def _draw(self):
+        width=max(80,self.winfo_width()); height=max(36,self.winfo_height())
+        super().delete("surface"); self.create_polygon(*rounded_points(width,height,13), smooth=True, splinesteps=18,
+            fill="#ffffff", outline="#d1d5db", width=1, tags="surface"); self.tag_lower("surface")
+        self.coords(self.entry_item,12,8); self.itemconfigure(self.entry_item,width=max(50,width-24),height=max(20,height-16))
+
+    def _resize(self, _event=None): self._draw()
+    def bind(self, sequence=None, func=None, add=None):
+        if hasattr(self, "entry"): return self.entry.bind(sequence, func, add)
+        return super().bind(sequence, func, add)
+    def focus_set(self): self.entry.focus_set()
+    def get(self): return self.entry.get()
+    def insert(self, index, value): return self.entry.insert(index, value)
+    def delete(self, first, last=None): return self.entry.delete(first, last)
+
+
+class RoundedButton(tk.Canvas):
+    """Small, consistent rounded Tk button for a ChatGPT-like desktop surface."""
+    def __init__(self, master, text, command=None, style="TButton", state="normal", **kwargs):
+        self.label = text; self.command = command; self.variant = style; self.button_state = state
+        super().__init__(master, height=42, width=max(88, len(text) * 8 + 34), bd=0, highlightthickness=0,
+                         background=self._parent_color(master), **kwargs)
+        self.bind("<Configure>", lambda _event: self._draw())
+        self.bind("<Enter>", self._hover); self.bind("<Leave>", self._leave)
+        self.bind("<ButtonRelease-1>", self._click)
+        self.bind("<Return>", self._click); self.bind("<space>", self._click); self.configure(takefocus=True)
+        self.bind("<FocusIn>", lambda _e: (setattr(self,"focused",True),self._draw()))
+        self.bind("<FocusOut>", lambda _e: (setattr(self,"focused",False),self._draw()))
+        self._draw()
+
+    @staticmethod
+    def _parent_color(master): return widget_background(master)
+
+    def _colors(self):
+        if self.button_state == "disabled": return "#e9ecef", "#9ca3af", "#e9ecef"
+        if self.variant == "Accent.TButton":
+            return ("#0e8f70", "#ffffff", "#0e8f70") if getattr(self, "hovered", False) else ("#10a37f", "#ffffff", "#10a37f")
+        fill = "#eef0f2" if getattr(self, "hovered", False) else "#ffffff"
+        return fill, "#202123", "#10a37f" if getattr(self,"focused",False) else "#d9dce1"
+
+    def _draw(self):
+        if not self.winfo_exists(): return
+        self.delete("all"); width = max(self.winfo_width(), 60); height = max(self.winfo_height(), 36)
+        fill, foreground, outline = self._colors(); radius = min(15, height // 2)
+        self.create_polygon(*rounded_points(width,height,radius), smooth=True, splinesteps=18, fill=fill, outline=outline, width=1)
+        self.create_text(width / 2, height / 2, text=self.label, fill=foreground, font=("Segoe UI Semibold", 9), width=max(40, width - 22))
+
+    def _hover(self, _event=None): self.hovered = True; self._draw()
+    def _leave(self, _event=None): self.hovered = False; self._draw()
+    def _click(self, _event=None):
+        if self.button_state != "disabled" and self.command: self.command()
+
+    def configure(self, cnf=None, **kwargs):
+        if isinstance(cnf, dict): kwargs = {**cnf, **kwargs}
+        if "text" in kwargs: self.label = kwargs.pop("text")
+        if "command" in kwargs: self.command = kwargs.pop("command")
+        if "style" in kwargs: self.variant = kwargs.pop("style")
+        if "state" in kwargs: self.button_state = kwargs.pop("state")
+        if kwargs: super().configure(**kwargs)
+        self._draw()
+
+    config = configure
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self._configure_styles()
         self.title(APP_NAME); self.geometry("1180x760"); self.minsize(900, 600)
         self.config_data = read_config(); self.index = Index(); self.events = queue.Queue(); self.rows = []
-        self.provider = tk.StringVar(value=self.config_data.get("provider", "Ollama"))
-        self.endpoint = tk.StringVar(value=self.config_data.get("endpoint", OLLAMA_URL))
+        default_models = Path("J:/OllamaModels") if Path("J:/OllamaModels").is_dir() else Path.home() / ".ollama" / "models"
+        self.model_dir_var = tk.StringVar(value=self.config_data.get("model_dir") or str(default_models))
+        self.model = tk.StringVar(value=self.config_data.get("model", "qwen2.5:7b"))
+        self.model_catalog = discover_model_files(self.model_dir_var.get())
+        for item in self.config_data.get("model_files", []):
+            candidate = Path(item).expanduser()
+            if candidate.is_file() and candidate.suffix.lower() == ".gguf": self.model_catalog.setdefault(candidate.stem, candidate.resolve())
+        if self.model_catalog and self.model.get() not in self.model_catalog:
+            self.model.set(next(iter(self.model_catalog)))
+        self.runtime_ready = runtime_executable() is not None
+        self.runtime_installing = False
         self.chats = self._read_chats(); self.active_chat_id = None
         self.chat_history = []; self.chat_attachments = []; self.chat_window = None; self.chat_busy = False
         self.chat_mode_var = tk.StringVar(value="Обычный чат"); self.goal_var = tk.StringVar(value="")
@@ -494,93 +679,198 @@ class App(tk.Tk):
         if self.chat_working_dir and not Path(self.chat_working_dir).is_dir(): self.chat_working_dir = ""
         self.last_assistant_answer = ""
         self._build(); self._refresh_folders(); self._refresh_results(); self._poll()
-        # Start/check the local Ollama service automatically; no console is shown.
-        self.after(900, self.check_models)
+        self.after(500, self._ensure_runtime)
 
     def _configure_styles(self):
         style = ttk.Style(self)
         try: style.theme_use("clam")
         except tk.TclError: pass
-        bg, panel, text, muted, accent = "#f3f5f9", "#ffffff", "#1f2937", "#64748b", "#4f46e5"
+        bg, panel, text, muted, accent = "#f7f7f8", "#ffffff", "#202123", "#6b7280", "#10a37f"
         self.configure(background=bg)
         style.configure(".", font=("Segoe UI", 10), background=bg, foreground=text)
         style.configure("TFrame", background=bg)
         style.configure("Surface.TFrame", background=panel)
-        style.configure("Sidebar.TFrame", background="#e9edf5")
+        style.configure("Sidebar.TFrame", background="#f0f2f5")
+        style.configure("Topbar.TFrame", background="#ffffff")
         style.configure("TLabel", background=bg, foreground=text)
         style.configure("Muted.TLabel", background=bg, foreground=muted)
-        style.configure("Title.TLabel", background=bg, foreground="#111827", font=("Segoe UI Semibold", 12))
-        style.configure("TButton", padding=(11, 7), background=panel, foreground=text, borderwidth=0)
-        style.map("TButton", background=[("active", "#e2e8f0"), ("pressed", "#cbd5e1")])
-        style.configure("Accent.TButton", padding=(13, 8), background=accent, foreground="#ffffff", font=("Segoe UI Semibold", 10))
-        style.map("Accent.TButton", background=[("active", "#4338ca"), ("pressed", "#3730a3"), ("disabled", "#a5b4fc")])
-        style.configure("TEntry", padding=7, fieldbackground=panel)
-        style.configure("TCombobox", padding=6, fieldbackground=panel, background=panel)
-        style.configure("TNotebook", background=bg, borderwidth=0)
-        style.configure("TNotebook.Tab", padding=(16, 9), background="#e9edf5", foreground=muted)
-        style.map("TNotebook.Tab", background=[("selected", panel)], foreground=[("selected", accent)])
-        style.configure("Treeview", rowheight=27, background=panel, fieldbackground=panel, foreground=text)
-        style.configure("Treeview.Heading", padding=7, background="#e9edf5", foreground=text, font=("Segoe UI Semibold", 9))
+        style.configure("Title.TLabel", background=bg, foreground="#171717", font=("Segoe UI Semibold", 13))
+        style.configure("Sidebar.TLabel", background="#f0f2f5", foreground="#202123")
+        style.configure("TopbarTitle.TLabel", background="#ffffff", foreground="#202123", font=("Segoe UI Semibold", 11))
+        style.configure("TButton", padding=(13, 9), background="#ffffff", foreground=text, borderwidth=1, bordercolor="#d9dce1", focusthickness=0)
+        style.map("TButton", background=[("active", "#eef0f2"), ("pressed", "#e4e7eb"), ("disabled", "#f1f2f4")], foreground=[("disabled", "#9ca3af")])
+        style.configure("Topbar.TButton", padding=(10, 8), background="#ffffff", foreground="#374151", borderwidth=1, bordercolor="#e1e4e8")
+        style.map("Topbar.TButton", background=[("active", "#f0f2f5"), ("pressed", "#e8eaed")])
+        style.configure("Accent.TButton", padding=(15, 10), background=accent, foreground="#ffffff", font=("Segoe UI Semibold", 10), borderwidth=0)
+        style.map("Accent.TButton", background=[("active", "#0e8f70"), ("pressed", "#0b795e"), ("disabled", "#a4cfc2")])
+        style.configure("TEntry", padding=(10, 9), fieldbackground="#ffffff", foreground=text, insertcolor=text, bordercolor="#d1d5db", lightcolor="#d1d5db", darkcolor="#d1d5db")
+        style.map("TEntry", fieldbackground=[("focus", "#ffffff")], bordercolor=[("focus", accent)])
+        style.configure("Rounded.TEntry", padding=(8, 6), fieldbackground="#ffffff", foreground=text, insertcolor=text, borderwidth=0, relief="flat")
+        style.configure("TCombobox", padding=(9, 7), fieldbackground="#ffffff", foreground=text, background="#f3f4f6", arrowcolor="#6b7280", bordercolor="#d1d5db")
+        style.map("TCombobox", fieldbackground=[("readonly", "#ffffff"), ("focus", "#ffffff")], foreground=[("readonly", text)], selectbackground=[("readonly", "#ffffff")], selectforeground=[("readonly", text)])
+        style.configure("TNotebook", background=bg, borderwidth=0, tabmargins=(4, 5, 4, 0))
+        style.configure("TNotebook.Tab", padding=(20, 12), background="#eef0f2", foreground="#6b7280", borderwidth=0)
+        style.map("TNotebook.Tab", background=[("selected", "#ffffff"), ("active", "#e7eaee")], foreground=[("selected", "#202123"), ("active", "#202123")])
+        style.configure("Treeview", rowheight=31, background="#ffffff", fieldbackground="#ffffff", foreground="#202123", borderwidth=0, font=("Segoe UI", 10))
+        style.map("Treeview", background=[("selected", "#dff3ed")], foreground=[("selected", "#145c49")])
+        style.configure("Treeview.Heading", padding=(10, 9), background="#f0f2f5", foreground="#4b5563", font=("Segoe UI Semibold", 9), borderwidth=0)
+        style.configure("Status.TLabel", background="#ffffff", foreground="#6b7280", padding=(12, 7), font=("Segoe UI", 9))
+        style.configure("TSeparator", background="#e5e7eb")
 
     def _build(self):
         self.columnconfigure(0, weight=1); self.rowconfigure(1, weight=1)
-        bar = ttk.Frame(self, padding=10); bar.grid(row=0, column=0, sticky="ew"); bar.columnconfigure(1, weight=1)
-        ttk.Label(bar, text="Папки для индексации:").grid(row=0, column=0, sticky="w")
-        self.folder_var = tk.StringVar(); ttk.Entry(bar, textvariable=self.folder_var, state="readonly").grid(row=0, column=1, sticky="ew", padx=8)
-        ttk.Button(bar, text="Добавить папку", command=self.add_folder).grid(row=0, column=2, padx=3)
-        ttk.Button(bar, text="Убрать", command=self.remove_folder).grid(row=0, column=3, padx=3)
-        ttk.Button(bar, text="Сканировать", command=self.scan).grid(row=0, column=4, padx=3)
+        bar = ttk.Frame(self, style="Topbar.TFrame", padding=(14, 11)); bar.grid(row=0, column=0, sticky="ew"); bar.columnconfigure(2, weight=1)
+        ttk.Label(bar, text="Локальные файлы", style="TopbarTitle.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 18))
+        ttk.Label(bar, text="Папки:", style="Sidebar.TLabel").grid(row=0, column=1, sticky="w")
+        self.folder_var = tk.StringVar(); RoundedEntry(bar, textvariable=self.folder_var, state="readonly").grid(row=0, column=2, sticky="ew", padx=8)
+        RoundedButton(bar, text="Добавить папку", command=self.add_folder, style="Topbar.TButton").grid(row=0, column=3, padx=3)
+        RoundedButton(bar, text="Убрать", command=self.remove_folder, style="Topbar.TButton").grid(row=0, column=4, padx=3)
+        RoundedButton(bar, text="Сканировать", command=self.scan, style="Accent.TButton").grid(row=0, column=5, padx=(4, 0))
         self.main_notebook = ttk.Notebook(self); self.main_notebook.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0,10))
-        self.files_tab = ttk.Frame(self.main_notebook); self.chat_tab = ttk.Frame(self.main_notebook)
+        self.files_tab = ttk.Frame(self.main_notebook); self.chat_tab = ttk.Frame(self.main_notebook); self.cursor_tab = ttk.Frame(self.main_notebook)
         self.main_notebook.add(self.files_tab, text="Файлы и поиск")
         self.main_notebook.add(self.chat_tab, text="Чат")
+        self.main_notebook.add(self.cursor_tab, text="Cursor")
         body = ttk.Panedwindow(self.files_tab, orient="horizontal"); body.grid(row=0, column=0, sticky="nsew")
         self.files_tab.columnconfigure(0, weight=1); self.files_tab.rowconfigure(0, weight=1)
         left = ttk.Frame(body, padding=6); left.columnconfigure(0, weight=1); left.rowconfigure(2, weight=1); body.add(left, weight=3)
         search = ttk.Frame(left); search.grid(row=0, column=0, sticky="ew"); search.columnconfigure(0, weight=1)
-        self.query = tk.StringVar(); ent = ttk.Entry(search, textvariable=self.query); ent.grid(row=0, column=0, sticky="ew"); ent.bind("<Return>", lambda e: self._refresh_results())
-        ttk.Button(search, text="Найти", command=self._refresh_results).grid(row=0, column=1, padx=4)
+        self.query = tk.StringVar(); ent = RoundedEntry(search, textvariable=self.query); ent.grid(row=0, column=0, sticky="ew"); ent.bind("<Return>", lambda e: self._refresh_results())
+        RoundedButton(search, text="Найти", command=self._refresh_results).grid(row=0, column=1, padx=4)
         ttk.Label(left, text="Ищет в именах файлов и тексте TXT, DOCX, XLSX, PPTX, ODT, CSV, PDF* и других текстовых файлов.", wraplength=500).grid(row=1, column=0, sticky="w", pady=6)
         self.tree = ttk.Treeview(left, columns=("type", "size", "date"), show="tree headings", selectmode="browse")
         self.tree.heading("#0", text="Файл"); self.tree.heading("type", text="Тип"); self.tree.heading("size", text="Размер"); self.tree.heading("date", text="Изменён")
         self.tree.column("#0", width=340); self.tree.column("type", width=75); self.tree.column("size", width=90); self.tree.column("date", width=125)
         self.tree.grid(row=2, column=0, sticky="nsew"); self.tree.bind("<<TreeviewSelect>>", self._show_selected); self.tree.bind("<Double-1>", lambda e: self.open_selected())
         actions = ttk.Frame(left); actions.grid(row=3, column=0, sticky="ew", pady=6)
-        ttk.Button(actions, text="Открыть файл", command=self.open_selected).pack(side="left", padx=(0,5))
-        ttk.Button(actions, text="Переименовать", command=self.rename_selected).pack(side="left", padx=5)
-        ttk.Button(actions, text="Переместить…", command=self.move_selected).pack(side="left", padx=5)
+        RoundedButton(actions, text="Открыть файл", command=self.open_selected).pack(side="left", padx=(0,5))
+        RoundedButton(actions, text="Переименовать", command=self.rename_selected).pack(side="left", padx=5)
+        RoundedButton(actions, text="Переместить…", command=self.move_selected).pack(side="left", padx=5)
         right = ttk.Frame(body, padding=8); right.columnconfigure(0, weight=1); right.rowconfigure(1, weight=1); body.add(right, weight=2)
         ttk.Label(right, text="Содержимое документа").grid(row=0, column=0, sticky="w")
-        self.preview = tk.Text(right, wrap="word", font=("Segoe UI", 10), state="disabled"); self.preview.grid(row=1, column=0, sticky="nsew", pady=6)
-        ttk.Label(right, text="Локальный ИИ").grid(row=2, column=0, sticky="w", pady=(6,2))
-        provider_bar = ttk.Frame(right); provider_bar.grid(row=3, column=0, sticky="ew"); provider_bar.columnconfigure(1, weight=1)
-        ttk.Label(provider_bar, text="Подключение").grid(row=0, column=0, sticky="w")
-        self.provider_box = ttk.Combobox(provider_bar, textvariable=self.provider, values=["Ollama", "LM Studio"], state="readonly", width=12); self.provider_box.grid(row=0, column=1, sticky="ew", padx=4); self.provider_box.bind("<<ComboboxSelected>>", self._provider_changed)
-        ttk.Label(right, text="Локальный адрес API").grid(row=4, column=0, sticky="w")
-        ttk.Entry(right, textvariable=self.endpoint).grid(row=5, column=0, sticky="ew")
-        model_bar = ttk.Frame(right); model_bar.grid(row=6, column=0, sticky="ew", pady=4); model_bar.columnconfigure(0, weight=1)
-        self.model = tk.StringVar(value=self.config_data.get("model", "qwen2.5:7b"))
-        choices = [self.model.get(), "qwen2.5:3b", "qwen2.5:7b", "deepseek-r1:14b", "qwen2.5vl:7b", "qwen3-vl:4b"]
-        self.model_box = ttk.Combobox(model_bar, textvariable=self.model, values=list(dict.fromkeys(choices))); self.model_box.grid(row=0, column=0, sticky="ew")
-        ttk.Button(model_bar, text="Найти модели", command=self.check_models).grid(row=0, column=1, padx=4)
-        ttk.Button(right, text="Открыть чат", command=self.open_chat).grid(row=7, column=0, sticky="ew", pady=(4,2))
-        self.ai_question = tk.StringVar(); ttk.Entry(right, textvariable=self.ai_question).grid(row=8, column=0, sticky="ew", pady=4); self.ai_question.set("Вопрос по выбранным файлам…")
-        ttk.Button(right, text="Ответить по файлам", command=self.ask_ai).grid(row=9, column=0, sticky="ew")
-        ttk.Button(right, text="Предложить сортировку", command=self.organize_ai).grid(row=10, column=0, sticky="ew", pady=5)
-        ttk.Label(right, text="* Для PDF-поиска установите pypdf. Ollama: порт 11434. LM Studio: обычно 1234/v1.", wraplength=370).grid(row=11, column=0, sticky="w", pady=5)
-        self.status = tk.StringVar(value="Добавьте папку и нажмите «Сканировать»."); ttk.Label(self, textvariable=self.status, relief="sunken", anchor="w", padding=4).grid(row=2, column=0, sticky="ew")
+        self.preview = tk.Text(right, wrap="word", font=("Segoe UI", 10), state="disabled", background="#ffffff", foreground="#374151", insertbackground="#202123", borderwidth=0, padx=12, pady=10); self.preview.grid(row=1, column=0, sticky="nsew", pady=6)
+        ttk.Label(right, text="Встроенная локальная модель").grid(row=2, column=0, sticky="w", pady=(6,2))
+        model_folder = ttk.Frame(right); model_folder.grid(row=3, column=0, sticky="ew"); model_folder.columnconfigure(0, weight=1)
+        RoundedEntry(model_folder, textvariable=self.model_dir_var, state="readonly").grid(row=0, column=0, sticky="ew")
+        RoundedButton(model_folder, text="Папка…", command=self.choose_model_dir).grid(row=0, column=1, padx=(4,0))
+        model_bar = ttk.Frame(right); model_bar.grid(row=4, column=0, sticky="ew", pady=4); model_bar.columnconfigure(0, weight=1)
+        self.model_box = ttk.Combobox(model_bar, textvariable=self.model, values=tuple(self.model_catalog), state="readonly"); self.model_box.grid(row=0, column=0, sticky="ew")
+        self.model_box.bind("<<ComboboxSelected>>", self._model_changed)
+        RoundedButton(model_bar, text="Добавить GGUF…", command=self._select_model_from_files).grid(row=0, column=1, padx=3)
+        RoundedButton(model_bar, text="Обновить", command=self.check_models).grid(row=0, column=2, padx=3)
+        RoundedButton(right, text="Открыть чат", command=self.open_chat).grid(row=5, column=0, sticky="ew", pady=(4,2))
+        self.ai_question = tk.StringVar(); RoundedEntry(right, textvariable=self.ai_question).grid(row=6, column=0, sticky="ew", pady=4); self.ai_question.set("Вопрос по выбранным файлам…")
+        RoundedButton(right, text="Ответить по файлам", command=self.ask_ai).grid(row=7, column=0, sticky="ew")
+        RoundedButton(right, text="Предложить сортировку", command=self.organize_ai).grid(row=8, column=0, sticky="ew", pady=5)
+        ttk.Label(right, text="Модель запускается внутри приложения напрямую из выбранной папки. Отдельный сервер не нужен.", wraplength=370).grid(row=9, column=0, sticky="w", pady=5)
+        self.status = tk.StringVar(value="Добавьте папку и нажмите «Сканировать»."); ttk.Label(self, textvariable=self.status, style="Status.TLabel", anchor="w").grid(row=2, column=0, sticky="ew")
         self._build_chat_ui(self.chat_tab)
+        self._build_cursor_tab()
         self.main_notebook.select(self.chat_tab)
 
     def _refresh_folders(self): self.folder_var.set("; ".join(self.config_data["folders"]) or "Папки не выбраны")
-    def _provider_changed(self, _event=None):
-        endpoint = self.endpoint.get().strip().rstrip("/")
-        if self.provider.get() == "LM Studio" and endpoint == OLLAMA_URL:
-            self.endpoint.set("http://127.0.0.1:1234/v1")
-        elif self.provider.get() == "Ollama" and endpoint == "http://127.0.0.1:1234/v1":
-            self.endpoint.set(OLLAMA_URL)
-        self.config_data.update({"provider": self.provider.get(), "endpoint": self.endpoint.get()}); write_config(self.config_data)
-        return "break"
+    def _model_changed(self, _event=None):
+        self.config_data.update({"model": self.model.get(), "model_dir": self.model_dir_var.get()})
+        write_config(self.config_data)
+        self.status.set(f"Выбрана модель {self.model.get()}. Она загрузится при следующем запросе.")
+    def _select_model_from_files(self):
+        files = filedialog.askopenfilenames(title="Добавить модели GGUF", filetypes=[("Модели GGUF", "*.gguf"), ("Все файлы", "*.*")])
+        if not files: return
+        # Keep several user-selected files in the catalog without copying them.
+        self.model_catalog.update({Path(item).stem: Path(item).resolve() for item in files if Path(item).suffix.lower() == ".gguf"})
+        remembered = set(self.config_data.get("model_files", [])); remembered.update(str(Path(item).resolve()) for item in files if Path(item).suffix.lower() == ".gguf")
+        self.config_data["model_files"] = sorted(remembered, key=str.casefold); write_config(self.config_data)
+        self._set_model_choices(self.model_catalog)
+        if files:
+            self.model.set(Path(files[0]).stem); self._model_changed()
+    def _build_cursor_tab(self):
+        tab = self.cursor_tab
+        tab.columnconfigure(0, weight=1); tab.rowconfigure(1, weight=1)
+        toolbar = ttk.Frame(tab, padding=10); toolbar.grid(row=0, column=0, sticky="ew"); toolbar.columnconfigure(1, weight=1)
+        ttk.Label(toolbar, text="Проект:").grid(row=0, column=0, padx=(0, 6))
+        self.cursor_folder_label = tk.StringVar(value=self.chat_working_dir or "Выберите рабочую папку проекта")
+        ttk.Label(toolbar, textvariable=self.cursor_folder_label, style="Muted.TLabel").grid(row=0, column=1, sticky="w")
+        RoundedButton(toolbar, text="Выбрать папку…", command=self.choose_chat_working_dir).grid(row=0, column=2, padx=4)
+        RoundedButton(toolbar, text="Обновить", command=self.refresh_cursor_files).grid(row=0, column=3, padx=4)
+        split = ttk.Panedwindow(tab, orient="horizontal"); split.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 8))
+        left = ttk.Frame(split, padding=6); left.columnconfigure(0, weight=1); left.rowconfigure(0, weight=1)
+        self.cursor_tree = ttk.Treeview(left, columns=("size",), show="tree headings", selectmode="browse")
+        self.cursor_tree.heading("#0", text="Файлы проекта"); self.cursor_tree.heading("size", text="Размер")
+        self.cursor_tree.column("#0", width=300); self.cursor_tree.column("size", width=90)
+        self.cursor_tree.grid(row=0, column=0, sticky="nsew"); self.cursor_tree.bind("<<TreeviewSelect>>", self._preview_cursor_file)
+        left_scroll = ttk.Scrollbar(left, orient="vertical", command=self.cursor_tree.yview); left_scroll.grid(row=0, column=1, sticky="ns"); self.cursor_tree.configure(yscrollcommand=left_scroll.set)
+        right = ttk.Frame(split, padding=6); right.columnconfigure(0, weight=1); right.rowconfigure(1, weight=1)
+        ttk.Label(right, text="Предпросмотр выбранного файла", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        self.cursor_preview = tk.Text(right, wrap="none", state="disabled", font=("Cascadia Code", 10), background="#ffffff", foreground="#374151", insertbackground="#202123", borderwidth=0, padx=12, pady=10)
+        self.cursor_preview.grid(row=1, column=0, sticky="nsew", pady=6)
+        preview_scroll = ttk.Scrollbar(right, orient="vertical", command=self.cursor_preview.yview); preview_scroll.grid(row=1, column=1, sticky="ns"); self.cursor_preview.configure(yscrollcommand=preview_scroll.set)
+        ttk.Label(right, text="Модель для задач:").grid(row=2, column=0, sticky="w", pady=(4, 2))
+        model_row = ttk.Frame(right); model_row.grid(row=3, column=0, sticky="ew"); model_row.columnconfigure(0, weight=1)
+        self.cursor_model_box = ttk.Combobox(model_row, textvariable=self.model, values=tuple(self.model_catalog), state="readonly")
+        self.cursor_model_box.grid(row=0, column=0, sticky="ew"); self.cursor_model_box.bind("<<ComboboxSelected>>", self._model_changed)
+        RoundedButton(model_row, text="Обновить", command=self.check_models).grid(row=0, column=1, padx=4)
+        RoundedButton(model_row, text="Добавить GGUF…", command=self._select_model_from_files).grid(row=0, column=2, padx=4)
+        task = ttk.Frame(tab, padding=(10, 0, 10, 10)); task.grid(row=2, column=0, sticky="ew"); task.columnconfigure(0, weight=1)
+        ttk.Label(task, text="Опишите, что нужно сделать с выбранным файлом. Перед сохранением приложение покажет diff и запросит подтверждение.").grid(row=0, column=0, sticky="w")
+        self.cursor_task_input = tk.Text(task, height=3, wrap="word", font=("Segoe UI", 10), background="#ffffff", foreground="#202123", insertbackground="#202123", selectbackground="#dff3ed", borderwidth=1, relief="solid", highlightthickness=1, highlightbackground="#d1d5db", highlightcolor="#10a37f", padx=10, pady=8); self.cursor_task_input.grid(row=1, column=0, sticky="ew", pady=5)
+        RoundedButton(task, text="Открыть задачу в чате →", command=self.start_cursor_task, style="Accent.TButton").grid(row=1, column=1, padx=(8, 0))
+    def refresh_cursor_files(self):
+        if not hasattr(self, "cursor_tree"): return
+        self.cursor_tree.delete(*self.cursor_tree.get_children())
+        root = Path(self.chat_working_dir) if self.chat_working_dir else None
+        if not root or not root.is_dir(): return
+        for path in sorted(root.rglob("*"), key=lambda item: str(item).casefold()):
+            try:
+                if not path.is_file() or any(part in {".git", "__pycache__", "node_modules", ".venv", "venv"} for part in path.relative_to(root).parts): continue
+                if path.stat().st_size > 2_000_000: continue
+                self.cursor_tree.insert("", "end", iid=str(path.resolve()), text=str(path.relative_to(root)), values=(human_size(path.stat().st_size),))
+            except OSError: continue
+    def _preview_cursor_file(self, _event=None):
+        selected = self.cursor_tree.selection()
+        text = ""
+        if selected:
+            path = Path(selected[0])
+            try:
+                if path.suffix.lower() in SUPPORTED: text = extract_text(path)[:50000]
+                elif is_plain_text_file(path): text = read_editable_text(path)[0][:50000]
+                else: text = "Бинарный файл. Для работы с ним прикрепите его в чате, если формат поддерживается."
+            except (OSError, UnicodeError, ValueError, ImportError, zipfile.BadZipFile): text = "Не удалось прочитать файл."
+        self.cursor_preview.configure(state="normal"); self.cursor_preview.delete("1.0", "end"); self.cursor_preview.insert("1.0", text or "Выберите файл проекта")
+        self.cursor_preview.configure(state="disabled")
+    def start_cursor_task(self):
+        selected = self.cursor_tree.selection(); prompt = self.cursor_task_input.get("1.0", "end-1c").strip()
+        if not selected: messagebox.showinfo(APP_NAME, "Сначала выберите файл проекта."); return
+        if not prompt: messagebox.showinfo(APP_NAME, "Опишите задачу для выбранного файла."); return
+        self.project_file_path = Path(selected[0]); self.chat_mode_var.set("Режим Cursor"); self._mode_changed()
+        self.main_notebook.select(self.chat_tab)
+        self.chat_input.delete("1.0", "end"); self.chat_input.insert("1.0", prompt); self.send_chat()
+    def _ensure_runtime(self):
+        if self.runtime_ready:
+            self.check_models()
+            return
+        if self.runtime_installing: return
+        self.runtime_installing = True
+        self.status.set("Первый запуск: устанавливаю встроенный CUDA-движок локальной модели…")
+        def work():
+            ok, detail = install_inference_runtime()
+            def finish():
+                self.runtime_installing = False
+                self.runtime_ready = ok
+                if ok:
+                    self.status.set("Встроенный движок готов. Выберите локальную модель и отправьте запрос.")
+                    self.check_models()
+                else:
+                    self.status.set("Не удалось установить локальный движок; подробности сохранены в журнале установки.")
+                    messagebox.showerror(APP_NAME, "Не удалось установить встроенный движок моделей.\\n" + detail)
+            self.after(0, finish)
+        threading.Thread(target=work, daemon=True).start()
+    def choose_model_dir(self):
+        initial = self.model_dir_var.get() if Path(self.model_dir_var.get()).is_dir() else str(Path.home())
+        folder = filedialog.askdirectory(title="Выберите папку локальных моделей", initialdir=initial)
+        if not folder: return
+        self.model_dir_var.set(str(Path(folder).resolve()))
+        self.config_data["model_dir"] = self.model_dir_var.get(); write_config(self.config_data)
+        self.check_models()
     def add_folder(self):
         folder = filedialog.askdirectory(title="Выберите папку для индексации")
         if folder and folder not in self.config_data["folders"]:
@@ -632,27 +922,24 @@ class App(tk.Tk):
         try: shutil.move(str(source), str(target)); self.index.relocate(source, target); self._refresh_results()
         except OSError as e: messagebox.showerror(APP_NAME, str(e))
     def check_models(self):
-        provider = self.provider.get(); endpoint = self.endpoint.get().strip()
-        self.config_data.update({"provider": provider, "endpoint": endpoint, "model": self.model.get()}); write_config(self.config_data)
-        self.status.set(f"Поиск локальных моделей: {provider}…")
+        folder = self.model_dir_var.get().strip()
+        self.config_data.update({"model_dir": folder, "model": self.model.get()}); write_config(self.config_data)
+        self.status.set("Сканирую каталог локальных GGUF-моделей…")
         def work():
-            try:
-                tags = local_model_names(provider, endpoint)
-                if not tags and provider == "Ollama" and endpoint.rstrip("/") == OLLAMA_URL and try_start_ollama():
-                    for _ in range(15):
-                        time.sleep(1)
-                        try: tags = local_model_names(provider, endpoint); break
-                        except Exception: pass
-                message = f"{provider}: " + (", ".join(tags) if tags else "модели не найдены")
-                self.events.put(message)
-                if tags: self.after(0, lambda names=tuple(tags): self._set_model_choices(names))
-            except Exception as e:
-                started = provider == "Ollama" and endpoint.rstrip("/") == OLLAMA_URL and try_start_ollama()
-                self.events.put("Запускаю Ollama…" if started else f"Не удалось подключиться к {provider}: {e}")
+            catalog = discover_model_files(folder)
+            self.after(0, lambda values=catalog: self._set_model_choices(values))
         threading.Thread(target=work, daemon=True).start()
     def _set_model_choices(self, names):
-        self.model_box.configure(values=names)
-        if self.chat_window and self.chat_window.winfo_exists(): self.chat_model_box.configure(values=names)
+        self.model_catalog = dict(names)
+        for item in self.config_data.get("model_files", []):
+            candidate = Path(item).expanduser()
+            if candidate.is_file() and candidate.suffix.lower() == ".gguf": self.model_catalog.setdefault(candidate.stem, candidate.resolve())
+        choices = tuple(self.model_catalog)
+        self.model_box.configure(values=choices)
+        self.chat_model_box.configure(values=choices)
+        if hasattr(self, "cursor_model_box"): self.cursor_model_box.configure(values=choices)
+        if self.model.get() not in self.model_catalog and choices: self.model.set(choices[0])
+        self.status.set(f"Найдено локальных моделей: {len(choices)}" if choices else "В выбранной папке не найдено моделей GGUF")
     def _context(self):
         selected = self.selected()
         rows = [selected] if selected else self.index.search(self.query.get(), limit=5)
@@ -669,12 +956,12 @@ class App(tk.Tk):
         context = "\n".join(f"{r[0]} | {(r[5] or '')[:500]}" for r in rows)
         self._ai("Предложи порядок для этих файлов: сгруппируй по смыслу и предложи имена папок. НИЧЕГО не перемещай. Ответ по-русски, в виде конкретного плана.\n" + context)
     def _ai(self, prompt):
-        model = self.model.get().strip(); provider = self.provider.get(); endpoint = self.endpoint.get().strip()
-        self.config_data.update({"model": model, "provider": provider, "endpoint": endpoint}); write_config(self.config_data)
+        model = self.model.get().strip()
+        self.config_data.update({"model": model, "model_dir": self.model_dir_var.get()}); write_config(self.config_data)
         self.status.set("ИИ обрабатывает запрос локально…")
         def work():
             try:
-                answer = local_chat(provider, endpoint, model, [{"role": "user", "content": prompt}]) or "Пустой ответ"
+                answer = local_chat(self.model_dir_var.get(), model, [{"role": "user", "content": prompt}]) or "Пустой ответ"
                 self.after(0, lambda: self._answer(answer))
             except Exception as e:
                 self.after(0, lambda: messagebox.showerror("Локальная модель недоступна", f"{e}\n\nПроверьте локальный адрес, выбранную модель и её запуск."))
@@ -742,6 +1029,9 @@ class App(tk.Tk):
         saved_dir = chat.get("working_dir", self.config_data.get("chat_working_dir", ""))
         self.chat_working_dir = saved_dir if saved_dir and Path(saved_dir).is_dir() else ""
         self.chat_folder_label.set(self.chat_working_dir or "Рабочая папка не выбрана")
+        if hasattr(self, "cursor_folder_label"):
+            self.cursor_folder_label.set(self.chat_working_dir or "Выберите рабочую папку проекта")
+            self.refresh_cursor_files()
         self.chat_edit_path = next((Path(item["path"]) for item in reversed(self.chat_attachments) if item.get("path") and Path(item["path"]).is_file()), None)
         self.project_file_path = self.chat_edit_path if self.chat_mode_var.get() == "Режим Cursor" else None
         self.chat_save_button.configure(state="normal" if self.last_assistant_answer else "disabled")
@@ -838,13 +1128,13 @@ class App(tk.Tk):
         self.chat_window = win
         win.columnconfigure(0, weight=1); win.rowconfigure(0, weight=1)
         outer = ttk.Panedwindow(win, orient="horizontal"); outer.grid(row=0, column=0, sticky="nsew")
-        sidebar = ttk.Frame(outer, padding=8); sidebar.columnconfigure(0, weight=1); sidebar.rowconfigure(2, weight=1)
+        sidebar = ttk.Frame(outer, padding=8, style="Sidebar.TFrame"); sidebar.columnconfigure(0, weight=1); sidebar.rowconfigure(2, weight=1)
         main = ttk.Frame(outer); main.columnconfigure(0, weight=1); main.rowconfigure(3, weight=1)
         outer.add(sidebar, weight=1); outer.add(main, weight=4)
-        ttk.Label(sidebar, text="История чатов", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, sticky="w", pady=(0,6))
-        ttk.Button(sidebar, text="＋ Новый чат", command=self.new_chat, style="Accent.TButton").grid(row=1, column=0, sticky="ew", pady=(0,6))
+        ttk.Label(sidebar, text="Ваши чаты", style="Sidebar.TLabel", font=("Segoe UI Semibold", 11)).grid(row=0, column=0, sticky="w", pady=(0,6))
+        RoundedButton(sidebar, text="＋ Новый чат", command=self.new_chat, style="Accent.TButton").grid(row=1, column=0, sticky="ew", pady=(0,6))
         self.chat_listbox = tk.Listbox(sidebar, exportselection=False, activestyle="dotbox", font=("Segoe UI", 10))
-        self.chat_listbox.configure(background="#e9edf5", foreground="#334155", selectbackground="#c7d2fe", selectforeground="#1e1b4b", borderwidth=0, highlightthickness=0)
+        self.chat_listbox.configure(background="#f0f2f5", foreground="#374151", selectbackground="#dff3ed", selectforeground="#145c49", borderwidth=0, highlightthickness=0, font=("Segoe UI", 10))
         self.chat_listbox.grid(row=2, column=0, sticky="nsew"); self.chat_listbox.bind("<<ListboxSelect>>", self._select_chat_from_list)
         chat_scroll = ttk.Scrollbar(sidebar, orient="vertical", command=self.chat_listbox.yview); chat_scroll.grid(row=2, column=1, sticky="ns")
         self.chat_listbox.configure(yscrollcommand=chat_scroll.set)
@@ -855,17 +1145,16 @@ class App(tk.Tk):
         ttk.Label(head, text="Модель:").grid(row=0, column=2)
         self.chat_model_box = ttk.Combobox(head, textvariable=self.model, values=self.model_box.cget("values"), width=20)
         self.chat_model_box.grid(row=0, column=3, sticky="ew", padx=6); head.columnconfigure(3, weight=1)
-        self.chat_provider_box = ttk.Combobox(head, textvariable=self.provider, values=["Ollama", "LM Studio"], state="readonly", width=12)
-        self.chat_provider_box.grid(row=0, column=4, padx=4); self.chat_provider_box.bind("<<ComboboxSelected>>", self._provider_changed)
-        ttk.Button(head, text="Модели", command=self.check_models).grid(row=0, column=5, padx=4)
+        self.chat_model_box.bind("<<ComboboxSelected>>", self._model_changed)
+        RoundedButton(head, text="Обновить модели", command=self.check_models).grid(row=0, column=4, padx=4)
         folder_bar = ttk.Frame(main, padding=(8, 0, 8, 6)); folder_bar.grid(row=1, column=0, sticky="ew"); folder_bar.columnconfigure(1, weight=1)
-        ttk.Button(folder_bar, text="Рабочая папка…", command=self.choose_chat_working_dir).grid(row=0, column=0, padx=(0,6))
+        RoundedButton(folder_bar, text="Рабочая папка…", command=self.choose_chat_working_dir).grid(row=0, column=0, padx=(0,6))
         self.chat_folder_label = tk.StringVar(value=self.chat_working_dir or "Рабочая папка не выбрана")
         ttk.Label(folder_bar, textvariable=self.chat_folder_label).grid(row=0, column=1, sticky="ew")
-        ttk.Button(folder_bar, text="Открыть папку", command=self.open_chat_working_dir).grid(row=0, column=2, padx=6)
+        RoundedButton(folder_bar, text="Открыть папку", command=self.open_chat_working_dir).grid(row=0, column=2, padx=6)
         self.goal_bar = ttk.Frame(main, padding=(8, 0, 8, 6)); self.goal_bar.columnconfigure(1, weight=1)
         ttk.Label(self.goal_bar, text="Цель:").grid(row=0, column=0, sticky="w")
-        self.goal_entry = ttk.Entry(self.goal_bar, textvariable=self.goal_var)
+        self.goal_entry = RoundedEntry(self.goal_bar, textvariable=self.goal_var)
         self.goal_entry.grid(row=0, column=1, sticky="ew", padx=6); self.goal_entry.bind("<FocusOut>", lambda _e: self._save_current_chat()); self.goal_entry.bind("<Return>", lambda _e: self._save_current_chat())
         body = ttk.Panedwindow(main, orient="horizontal"); body.grid(row=3, column=0, sticky="nsew", padx=8)
         self.project_panel = ttk.Frame(body, padding=6); self.project_panel.columnconfigure(0, weight=1); self.project_panel.rowconfigure(1, weight=1)
@@ -877,38 +1166,42 @@ class App(tk.Tk):
         project_scroll = ttk.Scrollbar(self.project_panel, orient="vertical", command=self.project_tree.yview); project_scroll.grid(row=1, column=1, sticky="ns")
         self.project_tree.configure(yscrollcommand=project_scroll.set)
         tree_actions = ttk.Frame(self.project_panel); tree_actions.grid(row=2, column=0, sticky="ew", pady=4)
-        ttk.Button(tree_actions, text="Обновить", command=self.refresh_project_files).pack(side="left", padx=2)
-        ttk.Button(tree_actions, text="Прикрепить выбранный", command=self.attach_project_file).pack(side="left", padx=2)
+        RoundedButton(tree_actions, text="Обновить", command=self.refresh_project_files).pack(side="left", padx=2)
+        RoundedButton(tree_actions, text="Прикрепить выбранный", command=self.attach_project_file).pack(side="left", padx=2)
         self.editor_panel = ttk.Frame(body, padding=6); self.editor_panel.columnconfigure(0, weight=1); self.editor_panel.rowconfigure(1, weight=1)
         self.project_file_label = tk.StringVar(value="Выберите файл проекта")
         ttk.Label(self.editor_panel, textvariable=self.project_file_label, style="Title.TLabel").grid(row=0, column=0, sticky="ew", pady=(0, 5))
-        self.project_editor = tk.Text(self.editor_panel, wrap="none", state="disabled", font=("Cascadia Code", 10), background="#ffffff", foreground="#1f2937", insertbackground="#4f46e5", borderwidth=0, highlightthickness=1, highlightbackground="#d7ddea")
+        self.project_editor = tk.Text(self.editor_panel, wrap="none", state="disabled", font=("Cascadia Code", 10), background="#ffffff", foreground="#374151", insertbackground="#10a37f", borderwidth=0, highlightthickness=1, highlightbackground="#e5e7eb")
         self.project_editor.grid(row=1, column=0, sticky="nsew")
         editor_scroll = ttk.Scrollbar(self.editor_panel, orient="vertical", command=self.project_editor.yview); editor_scroll.grid(row=1, column=1, sticky="ns"); self.project_editor.configure(yscrollcommand=editor_scroll.set)
         editor_actions = ttk.Frame(self.editor_panel); editor_actions.grid(row=2, column=0, sticky="ew", pady=4)
-        ttk.Button(editor_actions, text="Открыть в приложении", command=self.open_project_file).pack(side="left", padx=2)
-        ttk.Button(editor_actions, text="Задача с файлом → diff", command=self.prepare_edit, style="Accent.TButton").pack(side="right", padx=2)
+        RoundedButton(editor_actions, text="Открыть в приложении", command=self.open_project_file).pack(side="left", padx=2)
+        RoundedButton(editor_actions, text="Задача с файлом → diff", command=self.prepare_edit, style="Accent.TButton").pack(side="right", padx=2)
         transcript = ttk.Frame(body); transcript.columnconfigure(0, weight=1); transcript.rowconfigure(0, weight=1)
         body.add(transcript, weight=4); self.chat_body = body
-        self.chat_display = tk.Text(transcript, wrap="word", state="disabled", font=("Segoe UI", 11), padx=20, pady=16, background="#ffffff", foreground="#1f2937", insertbackground="#4f46e5", selectbackground="#c7d2fe", borderwidth=0, highlightthickness=0)
+        self.chat_display = tk.Text(transcript, wrap="word", state="disabled", font=("Segoe UI", 11), padx=24, pady=18, background="#ffffff", foreground="#202123", insertbackground="#10a37f", selectbackground="#dff3ed", borderwidth=0, highlightthickness=0)
         self.chat_display.grid(row=0, column=0, sticky="nsew")
         chat_history_scroll = ttk.Scrollbar(transcript, orient="vertical", command=self.chat_display.yview)
         chat_history_scroll.grid(row=0, column=1, sticky="ns"); self.chat_display.configure(yscrollcommand=chat_history_scroll.set)
-        self.chat_display.tag_configure("user", foreground="#4338ca", spacing1=14, spacing3=7, font=("Segoe UI Semibold", 10, "bold"))
-        self.chat_display.tag_configure("assistant", foreground="#1f2937", spacing1=9, spacing3=18)
-        self.chat_display.tag_configure("system", foreground="#64748b", spacing1=8, spacing3=8)
+        self.chat_display.tag_configure("user", foreground="#08765b", spacing1=14, spacing3=7, font=("Segoe UI Semibold", 10, "bold"))
+        self.chat_display.tag_configure("assistant", foreground="#202123", spacing1=9, spacing3=18)
+        self.chat_display.tag_configure("system", foreground="#6b7280", spacing1=8, spacing3=8)
         foot = ttk.Frame(main, padding=8); foot.grid(row=4, column=0, sticky="ew"); foot.columnconfigure(0, weight=1)
         self.attached_label = tk.StringVar(value="Файл не прикреплён")
         ttk.Label(foot, textvariable=self.attached_label).grid(row=0, column=0, sticky="w")
         attachment_actions = ttk.Frame(foot); attachment_actions.grid(row=0, column=1, padx=4)
-        ttk.Button(attachment_actions, text="Прикрепить файлы…", command=self.attach_chat_file).pack(side="left", padx=2)
-        ttk.Button(attachment_actions, text="Очистить вложения", command=self.clear_chat_files).pack(side="left", padx=2)
-        self.chat_input = tk.Text(foot, height=4, wrap="word", font=("Segoe UI", 10), padx=10, pady=8, background="#ffffff", foreground="#1f2937", insertbackground="#4f46e5", selectbackground="#c7d2fe", borderwidth=1, relief="solid", highlightthickness=1, highlightbackground="#d7ddea", highlightcolor="#818cf8")
-        self.chat_input.grid(row=1, column=0, sticky="ew", pady=6); self.chat_input.bind("<Return>", self._chat_enter)
+        RoundedButton(attachment_actions, text="Прикрепить файлы…", command=self.attach_chat_file).pack(side="left", padx=2)
+        RoundedButton(attachment_actions, text="Очистить вложения", command=self.clear_chat_files).pack(side="left", padx=2)
+        self.chat_composer = tk.Canvas(foot, height=112, background="#f7f7f8", bd=0, highlightthickness=0)
+        self.chat_composer.grid(row=1, column=0, sticky="ew", pady=6)
+        self.chat_input = tk.Text(self.chat_composer, height=4, wrap="word", font=("Segoe UI", 10), padx=2, pady=6, background="#ffffff", foreground="#202123", insertbackground="#202123", selectbackground="#dff3ed", borderwidth=0, relief="flat", highlightthickness=0)
+        self.chat_composer_item = self.chat_composer.create_window(14, 10, anchor="nw", window=self.chat_input, width=600, height=90)
+        self.chat_composer.bind("<Configure>", self._resize_chat_composer)
+        self.chat_input.bind("<Return>", self._chat_enter)
         controls = ttk.Frame(foot); controls.grid(row=1, column=1, sticky="se", padx=4)
-        self.chat_send_button = ttk.Button(controls, text="Отправить", command=self.send_chat, style="Accent.TButton"); self.chat_send_button.pack(fill="x", pady=2)
-        self.chat_edit_button = ttk.Button(controls, text="Выполнить задачу с файлом", command=self.prepare_edit); self.chat_edit_button.pack(fill="x", pady=2)
-        self.chat_save_button = ttk.Button(controls, text="Сохранить ответ как файл…", command=self.save_chat_answer, state="disabled"); self.chat_save_button.pack(fill="x", pady=2)
+        self.chat_send_button = RoundedButton(controls, text="Отправить", command=self.send_chat, style="Accent.TButton"); self.chat_send_button.pack(fill="x", pady=2)
+        self.chat_edit_button = RoundedButton(controls, text="Выполнить задачу с файлом", command=self.prepare_edit); self.chat_edit_button.pack(fill="x", pady=2)
+        self.chat_save_button = RoundedButton(controls, text="Сохранить ответ как файл…", command=self.save_chat_answer, state="disabled"); self.chat_save_button.pack(fill="x", pady=2)
         ttk.Label(foot, text="Enter — отправить · Shift+Enter — новая строка · Файлы передаются локальной модели, сохранение ответа выполняется вами.").grid(row=2, column=0, columnspan=2, sticky="w")
         self._refresh_chat_list()
         if self.chats:
@@ -921,6 +1214,19 @@ class App(tk.Tk):
     def _chat_enter(self, event):
         if event.state & 0x0001: return
         self.send_chat(); return "break"
+
+    def _resize_chat_composer(self, event):
+        width = max(200, event.width); height = max(92, event.height)
+        self.chat_composer.delete("surface")
+        radius = 17; points = []
+        for cx, cy, start in ((width-radius, radius, -90), (width-radius, height-radius, 0), (radius, height-radius, 90), (radius, radius, 180)):
+            for step in range(7):
+                angle = math.radians(start + step * 15)
+                points.extend((cx + radius * math.cos(angle), cy + radius * math.sin(angle)))
+        self.chat_composer.create_polygon(*points, smooth=True, splinesteps=18, fill="#ffffff", outline="#d9dce1", width=1, tags="surface")
+        self.chat_composer.tag_lower("surface")
+        self.chat_composer.coords(self.chat_composer_item, 14, 10)
+        self.chat_composer.itemconfigure(self.chat_composer_item, width=max(120, width - 28), height=max(60, height - 20))
 
     def _render_chat(self):
         if not self.chat_window or not self.chat_window.winfo_exists(): return
@@ -954,7 +1260,9 @@ class App(tk.Tk):
             self.project_file_path = None
             self.config_data["chat_working_dir"] = self.chat_working_dir; write_config(self.config_data)
             self.chat_folder_label.set(self.chat_working_dir)
+            if hasattr(self, "cursor_folder_label"): self.cursor_folder_label.set(self.chat_working_dir)
             self._save_current_chat()
+            self.refresh_cursor_files()
             if self.chat_mode_var.get() == "Режим Cursor": self.refresh_project_files()
 
     def open_chat_working_dir(self):
@@ -1166,12 +1474,12 @@ class App(tk.Tk):
 
     def _run_chat(self, messages, purpose, edit_path=None, original=None, edit_kind="text", edit_encoding="utf-8"):
         self.chat_busy = True; self.chat_send_button.configure(state="disabled"); self.chat_edit_button.configure(state="disabled")
-        provider = self.provider.get(); endpoint = self.endpoint.get().strip(); model = self.model.get().strip()
-        self.config_data.update({"provider": provider, "endpoint": endpoint, "model": model}); write_config(self.config_data)
+        model = self.model.get().strip()
+        self.config_data.update({"model": model, "model_dir": self.model_dir_var.get()}); write_config(self.config_data)
         self.status.set(f"Запрос к локальной модели {model}…")
         def work():
             try:
-                answer = local_chat(provider, endpoint, model, messages)
+                answer = local_chat(self.model_dir_var.get(), model, messages)
                 if not answer: raise ValueError("Модель вернула пустой ответ")
                 self.after(0, lambda a=answer: self._chat_done(a, purpose, edit_path, original, edit_kind, edit_encoding))
             except Exception as e:
@@ -1227,12 +1535,12 @@ class App(tk.Tk):
         if self.chat_window and self.chat_window.winfo_exists():
             self.chat_send_button.configure(state="normal"); self.chat_edit_button.configure(state="normal")
         self.status.set("Не удалось получить ответ")
-        messagebox.showerror("Локальная модель недоступна", f"{error}\n\nПроверьте подключение и наличие модели в Ollama или LM Studio.")
+        messagebox.showerror("Локальная модель недоступна", f"{error}\n\nПроверьте выбранную GGUF-модель и журнал установки встроенного движка.")
 
     def _show_edit_preview(self, path, original, edited, edit_kind, edit_encoding="utf-8"):
         win = tk.Toplevel(self); win.title(f"Проверка правок — {path.name}"); win.geometry("1000x680"); win.columnconfigure(0, weight=1); win.rowconfigure(1, weight=1)
         ttk.Label(win, text="Проверьте каждую правку. Исходник пока не менялся; резервная копия создаётся только при замене.", padding=8).grid(row=0, column=0, sticky="w")
-        diff = tk.Text(win, wrap="none", font=("Consolas", 10)); diff.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+        diff = tk.Text(win, wrap="none", font=("Consolas", 10), background="#ffffff", foreground="#202123", insertbackground="#202123", selectbackground="#dff3ed", borderwidth=0, padx=10, pady=10); diff.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
         if edit_kind == "excel":
             lines = ["Изменения ячеек (файл не менялся):"]
             for change in edited:
@@ -1247,10 +1555,10 @@ class App(tk.Tk):
             diff.insert("1.0", "".join(difflib.unified_diff(original.splitlines(True), edited.splitlines(True), fromfile="исходник", tofile="версия ИИ")) or "Изменений нет.")
         diff.configure(state="disabled")
         buttons = ttk.Frame(win, padding=8); buttons.grid(row=2, column=0, sticky="e")
-        ttk.Button(buttons, text="Сохранить как копию", command=lambda: self._save_edit_copy(path, edited, win, edit_kind, edit_encoding)).pack(side="left", padx=4)
+        RoundedButton(buttons, text="Сохранить как копию", command=lambda: self._save_edit_copy(path, edited, win, edit_kind, edit_encoding)).pack(side="left", padx=4)
         if edit_kind != "excel" or path.suffix.lower() in {".xlsx", ".xlsm"}:
-            ttk.Button(buttons, text="Заменить исходник с backup", command=lambda: self._replace_with_backup(path, edited, win, edit_kind, edit_encoding)).pack(side="left", padx=4)
-        ttk.Button(buttons, text="Отмена", command=win.destroy).pack(side="left", padx=4)
+            RoundedButton(buttons, text="Заменить исходник с backup", command=lambda: self._replace_with_backup(path, edited, win, edit_kind, edit_encoding)).pack(side="left", padx=4)
+        RoundedButton(buttons, text="Отмена", command=win.destroy).pack(side="left", padx=4)
 
     def _save_edit_copy(self, path, edited, window, edit_kind, edit_encoding="utf-8"):
         target_ext = ".xlsx" if edit_kind == "excel" and path.suffix.lower() in {".xls", ".xlsb"} else path.suffix
@@ -1285,7 +1593,7 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, f"Не удалось сохранить правки. Резервная копия (если создана):\n{backup}\n\n{e}")
     def _answer(self, answer):
         win = tk.Toplevel(self); win.title("Ответ локального ИИ"); win.geometry("720x520")
-        text = tk.Text(win, wrap="word", padx=12, pady=12); text.pack(fill="both", expand=True); text.insert("1.0", answer); text.configure(state="disabled")
+        text = tk.Text(win, wrap="word", padx=16, pady=16, background="#ffffff", foreground="#202123", borderwidth=0); text.pack(fill="both", expand=True); text.insert("1.0", answer); text.configure(state="disabled")
     def _poll(self):
         try:
             while True: self.status.set(self.events.get_nowait()); self._refresh_results()
