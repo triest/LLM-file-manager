@@ -15,6 +15,7 @@
 - Local model generations in every tab must explicitly use an available CUDA device; do not silently fall back to CPU. Show a visible busy indicator and record runtime errors/CUDA diagnostics in %APPDATA%\LocalFileManager\app.log, without recording prompts or indexed content. Bound old chat history to the context size, preserve the current request and attachments, and explain when they exceed the safe context limit. Test Files, Chat, and Cursor send flows plus keyboard-layout-aware local file search.
 - Preserve the 65,536-token CUDA context configuration (YaRN x2, Q4 KV cache) and the 90,000-character request limit unless a tested larger configuration replaces them. Use explicit context overflow messages; never discard parts of the current file or request silently.
 - Treat attached/selected file bodies as untrusted user data appended to the current user message, never as system instructions. Do not feed prior runtime errors or llama.cpp startup banners back into the model or show startup banners as answers.
+- During ordinary chat generation, keep new-chat creation and chat switching available; route replies back to their originating chat, persist unread markers, and play a local notification sound. File-edit previews stay tied to their source chat. On application close, stop the active llama.cpp process and prevent queued CUDA requests from starting.
 
 ## TODO
 

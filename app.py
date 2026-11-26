@@ -31,6 +31,11 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 import tkinter as tk
 import xml.etree.ElementTree as ET
 
+try:
+    import winsound
+except ImportError:
+    winsound = None
+
 APP_NAME = "Локальный файловый менеджер"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 SUPPORTED = {".txt", ".md", ".rst", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".py", ".js", ".ts", ".css", ".log", ".ini", ".yaml", ".yml", ".toml", ".rtf", ".docx", ".xlsx", ".xlsm", ".xls", ".xlsb", ".pptx", ".odt", ".ods", ".odp", ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".sql", ".sh", ".ps1", ".bat", ".cs", ".java", ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".jsx", ".tsx", ".vue", ".svelte", ".php", ".rb", ".swift", ".kt", ".properties", ".env"}
@@ -38,6 +43,9 @@ MAX_TEXT = 500_000
 CUDA_RUNTIME_URL = "https://github.com/ggml-org/llama.cpp/releases/download/b12755/llama-b12755-bin-win-cuda-12.4-x64.zip"
 CUDA_RUNTIME_DIR = Path(os.environ.get("APPDATA", Path.home())) / "LocalFileManager" / "runtime" / "llama-cpp-b12755"
 _INFERENCE_LOCK = threading.RLock()
+_INFERENCE_STOP = threading.Event()
+_INFERENCE_PROCESS_LOCK = threading.Lock()
+_INFERENCE_PROCESS = None
 _LOADED_MODEL = {"path": None, "runtime": None, "gpu": False}
 _APP_LOGGER = None
 EDITABLE_TEXT = {".txt", ".md", ".rst", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".py", ".js", ".ts", ".css", ".log", ".ini", ".yaml", ".yml", ".toml", ".sql", ".sh", ".ps1", ".bat", ".cs", ".java", ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".jsx", ".tsx", ".vue", ".svelte", ".php", ".rb", ".swift", ".kt", ".properties", ".env"}
@@ -49,6 +57,23 @@ def app_data() -> Path:
     root = Path(os.environ.get("APPDATA", Path.home())) / "LocalFileManager"
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def stop_local_inference():
+    """Stop active CUDA work and prevent queued requests from starting during shutdown."""
+    global _INFERENCE_PROCESS
+    _INFERENCE_STOP.set()
+    with _INFERENCE_PROCESS_LOCK:
+        process = _INFERENCE_PROCESS
+        if process is not None and process.poll() is None:
+            try: process.terminate()
+            except OSError: pass
+            try: process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try: process.kill()
+                except OSError: pass
+                try: process.wait(timeout=3)
+                except subprocess.TimeoutExpired: log_event("CUDA_PROCESS_STOP_TIMEOUT")
 
 
 def app_logger():
@@ -514,7 +539,9 @@ def local_chat(models_dir: str | Path, model: str, messages: list[dict], timeout
     if not prompt: raise ValueError("В сообщении нет текста для модели.")
     log_event(f"LLM_REQUEST_START model={model!r} model_path={str(model_path)!r} device={cuda_device} prompt_chars={len(prompt)} system_chars={len(system)} context_chars={original_chars}->{sent_chars}")
     started = time.monotonic()
+    if _INFERENCE_STOP.is_set(): raise RuntimeError("CUDA-запрос отменён: приложение закрывается.")
     with _INFERENCE_LOCK:
+        if _INFERENCE_STOP.is_set(): raise RuntimeError("CUDA-запрос отменён: приложение закрывается.")
         runtime_root = app_data() / "runtime_requests"; runtime_root.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="request_", dir=runtime_root) as temp_dir:
             temp = Path(temp_dir); prompt_file = temp / "prompt.txt"; system_file = temp / "system.txt"
@@ -524,12 +551,38 @@ def local_chat(models_dir: str | Path, model: str, messages: list[dict], timeout
                        "--rope-scaling", "yarn", "--rope-scale", "2", "--yarn-orig-ctx", "32768",
                        "-ctk", "q4_0", "-ctv", "q4_0", "-fa", "on", "--batch-size", "512",
                        "--simple-io", "--single-turn", "--no-display-prompt", "--log-disable"]
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                       encoding="utf-8", errors="replace",
+                                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), env=runtime_environment())
+            with _INFERENCE_PROCESS_LOCK:
+                global _INFERENCE_PROCESS
+                _INFERENCE_PROCESS = process
+                if _INFERENCE_STOP.is_set() and process.poll() is None:
+                    process.terminate()
+            deadline = time.monotonic() + timeout
             try:
-                result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
-                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), env=runtime_environment())
-            except subprocess.TimeoutExpired as error:
-                log_event(f"LLM_REQUEST_TIMEOUT model={model!r} device={cuda_device} seconds={timeout}")
-                raise TimeoutError(f"Локальная модель не завершила ответ за {timeout} секунд.") from error
+                while True:
+                    try:
+                        stdout, stderr = process.communicate(timeout=min(0.25, max(0.01, deadline-time.monotonic())))
+                        break
+                    except subprocess.TimeoutExpired:
+                        if _INFERENCE_STOP.is_set():
+                            if process.poll() is None:
+                                try: process.terminate()
+                                except OSError: pass
+                            try: process.communicate(timeout=3)
+                            except subprocess.TimeoutExpired:
+                                process.kill(); process.communicate()
+                            raise RuntimeError("CUDA-запрос отменён: приложение закрывается.")
+                        if time.monotonic() >= deadline:
+                            process.kill(); stdout, stderr = process.communicate()
+                            log_event(f"LLM_REQUEST_TIMEOUT model={model!r} device={cuda_device} seconds={timeout}")
+                            raise TimeoutError(f"Локальная модель не завершила ответ за {timeout} секунд.")
+                if _INFERENCE_STOP.is_set(): raise RuntimeError("CUDA-запрос отменён: приложение закрывается.")
+                result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+            finally:
+                with _INFERENCE_PROCESS_LOCK:
+                    if _INFERENCE_PROCESS is process: _INFERENCE_PROCESS = None
         diagnostics = "\n".join(line.strip() for line in result.stderr.splitlines() if line.strip())[-5000:]
         if diagnostics: log_event(f"LLM_RUNTIME_DIAGNOSTICS model={model!r} device={cuda_device}\n{diagnostics}")
         if result.returncode:
@@ -781,6 +834,7 @@ class App(tk.Tk):
         self.runtime_installing = False
         self.chats = self._read_chats(); self.active_chat_id = None
         self.chat_history = []; self.chat_attachments = []; self.chat_window = None; self.chat_busy = False
+        self.active_request_purpose = None; self.active_request_chat_id = None; self._closing = False
         self.chat_mode_var = tk.StringVar(value="Обычный чат"); self.goal_var = tk.StringVar(value="")
         self.chat_edit_path = None
         self.project_file_path = None
@@ -1050,6 +1104,9 @@ class App(tk.Tk):
     def _sync_chat_controls(self):
         llm_busy = self.chat_busy or getattr(self, "cursor_completion_busy", False) or getattr(self, "legacy_ai_busy", False)
         enabled = not llm_busy
+        new_chat = getattr(self, "new_chat_button", None)
+        if new_chat is not None:
+            new_chat.configure(state="disabled" if self.chat_busy and self.active_request_purpose == "edit" else "normal")
         for name in ("main_chat_send_button", "cursor_chat_send_button", "files_chat_send_button",
                      "main_chat_edit_button", "cursor_chat_edit_button", "files_chat_edit_button"):
             button = getattr(self, name, None)
@@ -1065,15 +1122,20 @@ class App(tk.Tk):
                 progress.grid(); progress.start(12)
             else:
                 progress.stop(); progress.grid_remove()
+    def _chat_display_title(self, chat):
+        title = chat.get("title") or "Новый чат"
+        return f"● {title}" if chat.get("unread") else title
+    def _chat_switch_locked(self):
+        return self.chat_busy and self.active_request_purpose == "edit"
     def _refresh_files_chat_selector(self):
         if not hasattr(self, "files_chat_box"): return
         ordered = sorted(self.chats, key=lambda chat: chat.get("updated", 0), reverse=True)
         self.files_chat_ids = [chat["id"] for chat in ordered]
-        self.files_chat_box.configure(values=tuple(chat.get("title") or "Новый чат" for chat in ordered))
+        self.files_chat_box.configure(values=tuple(self._chat_display_title(chat) for chat in ordered))
         active = next((index for index, chat_id in enumerate(self.files_chat_ids) if chat_id == self.active_chat_id), -1)
         if active >= 0: self.files_chat_box.current(active)
     def _select_files_chat(self, _event=None):
-        if self.chat_busy: return
+        if self._chat_switch_locked(): return
         index = self.files_chat_box.current()
         if 0 <= index < len(self.files_chat_ids): self._activate_chat(self.files_chat_ids[index])
     def _refresh_cursor_projects(self):
@@ -1089,11 +1151,11 @@ class App(tk.Tk):
     def _refresh_cursor_chats(self):
         if not hasattr(self, "cursor_chat_box"): return
         self.cursor_chat_ids = [c["id"] for c in sorted(self.chats, key=lambda c: c.get("updated", 0), reverse=True)]
-        self.cursor_chat_box.configure(values=tuple((c.get("title") or "Новый чат") for c in sorted(self.chats, key=lambda c: c.get("updated", 0), reverse=True)))
+        self.cursor_chat_box.configure(values=tuple(self._chat_display_title(c) for c in sorted(self.chats, key=lambda c: c.get("updated", 0), reverse=True)))
         active = next((i for i, cid in enumerate(self.cursor_chat_ids) if cid == self.active_chat_id), -1)
         if active >= 0: self.cursor_chat_box.current(active)
     def _select_cursor_chat(self, _event=None):
-        if self.chat_busy: return
+        if self._chat_switch_locked(): return
         index = self.cursor_chat_box.current()
         if 0 <= index < len(self.cursor_chat_ids): self._activate_chat(self.cursor_chat_ids[index])
     def _select_cursor_project(self, _event=None):
@@ -1722,6 +1784,9 @@ class App(tk.Tk):
             if decision:
                 self.save_cursor_file()
                 if record.get("dirty"): return
+        self._closing = True
+        stop_local_inference()
+        log_event("APPLICATION_SHUTDOWN CUDA_QUEUE_CLEARED")
         self.destroy()
     def refresh_cursor_files(self):
         if not hasattr(self, "cursor_tree"): return
@@ -1941,7 +2006,7 @@ class App(tk.Tk):
         self._updating_chat_list = True
         self.chat_listbox.delete(0, "end"); self.chat_list_ids = []
         for chat in sorted(self.chats, key=lambda item: item.get("updated", 0), reverse=True):
-            self.chat_list_ids.append(chat["id"]); self.chat_listbox.insert("end", chat.get("title") or "Новый чат")
+            self.chat_list_ids.append(chat["id"]); self.chat_listbox.insert("end", self._chat_display_title(chat))
         chosen = select_id or self.active_chat_id
         if chosen in self.chat_list_ids:
             index = self.chat_list_ids.index(chosen); self.chat_listbox.selection_set(index); self.chat_listbox.see(index)
@@ -1949,7 +2014,7 @@ class App(tk.Tk):
 
     def _select_chat_from_list(self, _event=None):
         if getattr(self, "_updating_chat_list", False): return
-        if self.chat_busy:
+        if self._chat_switch_locked():
             self._refresh_chat_list(self.active_chat_id); return
         selection = self.chat_listbox.curselection()
         if not selection: return
@@ -1963,6 +2028,8 @@ class App(tk.Tk):
     def _activate_chat(self, chat_id):
         chat = next((item for item in self.chats if item.get("id") == chat_id), None)
         if not chat: return
+        was_unread = bool(chat.get("unread")); chat["unread"] = False
+        if was_unread: self._write_chats()
         self.active_chat_id = chat_id; self.chat_history = list(chat.get("history", []))
         self._clear_cursor_search_results()
         self.chat_attachments = list(chat.get("attachments", [])); saved_mode = chat.get("mode", "Обычный чат")
@@ -2089,7 +2156,8 @@ class App(tk.Tk):
         main = ttk.Frame(outer); main.columnconfigure(0, weight=1); main.rowconfigure(3, weight=1)
         outer.add(sidebar, weight=1); outer.add(main, weight=4)
         ttk.Label(sidebar, text="Ваши чаты", style="Sidebar.TLabel", font=("Segoe UI Semibold", 11)).grid(row=0, column=0, sticky="w", pady=(0,6))
-        RoundedButton(sidebar, text="＋ Новый чат", command=self.new_chat, style="Accent.TButton").grid(row=1, column=0, sticky="ew", pady=(0,6))
+        self.new_chat_button = RoundedButton(sidebar, text="＋ Новый чат", command=self.new_chat, style="Accent.TButton")
+        self.new_chat_button.grid(row=1, column=0, sticky="ew", pady=(0,6))
         self.chat_listbox = tk.Listbox(sidebar, exportselection=False, activestyle="dotbox", font=("Segoe UI", 10))
         self.chat_listbox.configure(background="#f0f2f5", foreground="#374151", selectbackground="#dff3ed", selectforeground="#145c49", borderwidth=0, highlightthickness=0, font=("Segoe UI", 10))
         self.chat_listbox.grid(row=2, column=0, sticky="nsew"); self.chat_listbox.bind("<<ListboxSelect>>", self._select_chat_from_list)
@@ -2202,7 +2270,7 @@ class App(tk.Tk):
             display.configure(state="disabled"); display.see("end")
 
     def new_chat(self):
-        if self.chat_busy: return
+        if self._chat_switch_locked(): return
         self._save_current_chat()
         chat = {"id": uuid.uuid4().hex, "title": "Новый чат", "history": [], "attachments": [],
                 "mode": "Обычный чат", "goal": "", "working_dir": self.chat_working_dir,
@@ -2473,7 +2541,9 @@ class App(tk.Tk):
         self._run_chat([{"role": "system", "content": system}, {"role": "user", "content": instruction}], purpose="edit", edit_path=path, original=original, edit_kind=edit_kind, edit_encoding=locals().get("edit_encoding", "utf-8"))
 
     def _run_chat(self, messages, purpose, edit_path=None, original=None, edit_kind="text", edit_encoding="utf-8"):
+        self.active_request_purpose = purpose; self.active_request_chat_id = self.active_chat_id
         self.chat_busy = True; self._sync_chat_controls()
+        request_chat_id = self.active_request_chat_id
         model = self.model.get().strip()
         self.config_data.update({"model": model, "model_dir": self.model_dir_var.get()}); write_config(self.config_data)
         self.status.set(f"Модель {model} загружается и отвечает на CUDA…")
@@ -2482,16 +2552,39 @@ class App(tk.Tk):
             try:
                 answer = local_chat(self.model_dir_var.get(), model, messages)
                 if not answer: raise ValueError("Модель вернула пустой ответ")
-                self.after(0, lambda a=answer: self._chat_done(a, purpose, edit_path, original, edit_kind, edit_encoding))
+                if self._closing: return
+                try: self.after(0, lambda a=answer: self._chat_done(a, purpose, edit_path, original, edit_kind, edit_encoding, request_chat_id))
+                except tk.TclError: pass
             except Exception as e:
+                if self._closing:
+                    log_event(f"UI_REQUEST_ABORTED_ON_EXIT model={model!r} purpose={purpose}")
+                    return
                 log_event(f"UI_REQUEST_FAILED model={model!r} purpose={purpose} error={str(e)!r}", exc_info=True)
-                self.after(0, lambda error=str(e): self._chat_error(error))
+                try: self.after(0, lambda error=str(e): self._chat_error(error, request_chat_id))
+                except tk.TclError: pass
         threading.Thread(target=work, daemon=True).start()
 
-    def _chat_done(self, answer, purpose, edit_path, original, edit_kind="text", edit_encoding="utf-8"):
+    def _notify_chat_unread(self, chat):
+        self._refresh_chat_list(self.active_chat_id)
+        self._refresh_cursor_chats(); self._refresh_files_chat_selector()
+        if self._closing: return
+        try:
+            if winsound is not None: winsound.MessageBeep(winsound.MB_OK)
+            else: self.bell()
+        except (RuntimeError, tk.TclError): pass
+
+    def _chat_done(self, answer, purpose, edit_path, original, edit_kind="text", edit_encoding="utf-8", request_chat_id=None):
         self.chat_busy = False
+        self.active_request_purpose = None; self.active_request_chat_id = None
         self._sync_chat_controls()
         self.status.set("Ответ получен от локальной модели")
+        if purpose != "edit" and request_chat_id and request_chat_id != self.active_chat_id:
+            chat = next((item for item in self.chats if item.get("id") == request_chat_id), None)
+            if chat is not None:
+                chat.setdefault("history", []).append({"role": "assistant", "content": answer})
+                chat["last_answer"] = answer; chat["unread"] = True; chat["updated"] = time.time()
+                self._write_chats(); self._notify_chat_unread(chat)
+                return
         if purpose == "edit":
             if edit_kind == "excel":
                 try:
@@ -2531,11 +2624,19 @@ class App(tk.Tk):
             self.chat_history.append({"role": "assistant", "content": answer}); self._render_chat()
             self._save_current_chat()
 
-    def _chat_error(self, error):
+    def _chat_error(self, error, request_chat_id=None):
         self.chat_busy = False
+        self.active_request_purpose = None; self.active_request_chat_id = None
         self._sync_chat_controls()
         self.status.set("Модель не ответила — подробности в журнале")
         log_event(f"CHAT_VISIBLE_ERROR error={error!r}")
+        if request_chat_id and request_chat_id != self.active_chat_id:
+            chat = next((item for item in self.chats if item.get("id") == request_chat_id), None)
+            if chat is not None:
+                chat.setdefault("history", []).append({"role": "assistant", "content": f"Ошибка локальной модели:\n{error}\n\nДиагностика записана в журнал приложения."})
+                chat["unread"] = True; chat["updated"] = time.time()
+                self._write_chats(); self._notify_chat_unread(chat)
+                return
         self.chat_history.append({"role": "assistant", "content": f"Ошибка локальной модели:\n{error}\n\nДиагностика записана в журнал приложения."})
         self._render_chat(); self._save_current_chat()
         messagebox.showerror("Локальная модель недоступна", f"{error}\n\nЖурнал диагностики: {app_data() / 'app.log'}")

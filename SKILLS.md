@@ -8,6 +8,8 @@ Users can select a folder containing multiple GGUF files, Ollama-style manifest/
 
 Every generation must explicitly select an available CUDA device and offload all model layers to the GPU; never silently fall back to CPU. The app verifies devices through llama.cpp --list-devices. The default context is 65,536 tokens (YaRN x2 from 32,768) with Q4 KV cache and Flash Attention; the safe request limit is 90,000 characters. Put attached/selected file bodies in the current user message as data, never in system instructions. Drop old runtime error/banner responses from the next request and remove llama.cpp startup banners from displayed model output. Local diagnostics are stored at %APPDATA%\LocalFileManager\app.log; logs may include model paths, timings, CUDA device details, and errors, but must never contain prompts or indexed file contents. Show a visible busy indicator during model loading/generation.
 
+Allow creating/switching chats during a normal model response and route its completion back to the originating chat. Mark responses received by inactive chats as unread, play a local notification sound, and clear the marker when opened. Keep file-edit preview requests tied to their source chat. When the main window closes, stop the running llama.cpp process and cancel requests waiting for the inference lock.
+
 ## File indexing and chat
 
 The user explicitly chooses folders to index. The index is stored in `%APPDATA%\LocalFileManager`; it contains extracted text and metadata while source files remain in place. Chat history and attachments stay local. Natural-language file-finding requests query the local index; only indexed folders are searched.
