@@ -14,3 +14,7 @@
 - When adding features, update `README.md` and check the shortcut launch, file indexing/search, local model connection, and reviewed text/DOCX editing. Use temporary samples for edit checks.
 - Local model generations in every tab must explicitly use an available CUDA device; do not silently fall back to CPU. Show a visible busy indicator and record runtime errors/CUDA diagnostics in %APPDATA%\LocalFileManager\app.log, without recording prompts or indexed content. Bound old chat history to the context size, preserve the current request and attachments, and explain when they exceed the safe context limit. Test Files, Chat, and Cursor send flows plus keyboard-layout-aware local file search.
 - Preserve the 65,536-token CUDA context configuration (YaRN x2, Q4 KV cache) and the 90,000-character request limit unless a tested larger configuration replaces them. Use explicit context overflow messages; never discard parts of the current file or request silently.
+
+## TODO
+
+- Read each GGUF model's context metadata and configure its context/YaRN settings accordingly; verify long-file requests on every supported model family and show a clear, actionable message when a request still exceeds the model's usable context.
