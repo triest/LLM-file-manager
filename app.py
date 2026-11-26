@@ -25,7 +25,7 @@ import tkinter as tk
 import xml.etree.ElementTree as ET
 
 APP_NAME = "Локальный файловый менеджер"
-SUPPORTED = {".txt", ".md", ".rst", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".py", ".js", ".ts", ".css", ".log", ".ini", ".yaml", ".yml", ".toml", ".rtf", ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".pdf", ".sql", ".sh", ".ps1", ".bat", ".cs", ".java", ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".jsx", ".tsx", ".vue", ".svelte", ".php", ".rb", ".swift", ".kt", ".properties", ".env"}
+SUPPORTED = {".txt", ".md", ".rst", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".py", ".js", ".ts", ".css", ".log", ".ini", ".yaml", ".yml", ".toml", ".rtf", ".docx", ".xlsx", ".xlsm", ".xls", ".xlsb", ".pptx", ".odt", ".ods", ".odp", ".pdf", ".sql", ".sh", ".ps1", ".bat", ".cs", ".java", ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".jsx", ".tsx", ".vue", ".svelte", ".php", ".rb", ".swift", ".kt", ".properties", ".env"}
 MAX_TEXT = 500_000
 OLLAMA_URL = "http://127.0.0.1:11434"
 EDITABLE_TEXT = {".txt", ".md", ".rst", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".py", ".js", ".ts", ".css", ".log", ".ini", ".yaml", ".yml", ".toml", ".sql", ".sh", ".ps1", ".bat", ".cs", ".java", ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".jsx", ".tsx", ".vue", ".svelte", ".php", ".rb", ".swift", ".kt", ".properties", ".env"}
@@ -65,6 +65,45 @@ def xml_text(data: bytes) -> str:
         root = ET.fromstring(data)
         return " ".join(t.strip() for t in root.itertext() if t and t.strip())
     except ET.ParseError:
+        return ""
+
+
+def extract_legacy_excel(path: Path) -> str:
+    """Read binary Excel formats with optional local parsers."""
+    ext = path.suffix.lower()
+    try:
+        if ext == ".xls":
+            import xlrd
+            book = xlrd.open_workbook(str(path), on_demand=True)
+            chunks = []; total = 0
+            for sheet in book.sheets():
+                chunks.append(sheet.name)
+                total += len(sheet.name)
+                for row in sheet.get_rows():
+                    line = "\t".join(str(cell.value) for cell in row if cell.value not in (None, ""))
+                    if line: chunks.append(line); total += len(line)
+                    if total >= MAX_TEXT: break
+                if total >= MAX_TEXT: break
+            book.release_resources()
+            return "\n".join(chunks)[:MAX_TEXT]
+        import pyxlsb
+        chunks = []; total = 0
+        with pyxlsb.open_workbook(str(path)) as book:
+            for sheet_name in book.sheets:
+                chunks.append(sheet_name)
+                total += len(sheet_name)
+                with book.get_sheet(sheet_name) as sheet:
+                    for row in sheet.rows():
+                        values = [str(cell.v) for cell in row if cell.v not in (None, "")]
+                        if values:
+                            line = "\t".join(values); chunks.append(line); total += len(line)
+                        if total >= MAX_TEXT: break
+                if total >= MAX_TEXT: break
+        return "\n".join(chunks)[:MAX_TEXT]
+    except ImportError:
+        package = "xlrd" if ext == ".xls" else "pyxlsb"
+        return f"[Для чтения {ext} установите локальный компонент {package} командой: python -m pip install -r requirements.txt]"
+    except (OSError, ValueError, zipfile.BadZipFile, KeyError):
         return ""
 
 
@@ -139,12 +178,13 @@ def extract_json_object(response: str):
 def extract_text(path: Path) -> str:
     ext = path.suffix.lower()
     try:
-        if ext in {".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp"}:
+        if ext in {".xls", ".xlsb"}: return extract_legacy_excel(path)
+        if ext in {".docx", ".xlsx", ".xlsm", ".pptx", ".odt", ".ods", ".odp"}:
             chunks = []
             with zipfile.ZipFile(path) as archive:
                 names = archive.namelist()
                 if ext == ".docx": names = [n for n in names if re.fullmatch(r"word/(document|header\d+|footer\d+|footnotes|endnotes)\.xml", n)]
-                elif ext == ".xlsx": names = [n for n in names if n == "xl/sharedStrings.xml" or re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n)]
+                elif ext in {".xlsx", ".xlsm"}: names = [n for n in names if n == "xl/sharedStrings.xml" or re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n)]
                 elif ext == ".pptx": names = [n for n in names if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)]
                 else: names = [n for n in names if re.fullmatch(r"content\.xml", n)]
                 for name in names[:300]:
@@ -275,6 +315,7 @@ def human_size(size):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        self._configure_styles()
         self.title(APP_NAME); self.geometry("1180x760"); self.minsize(900, 600)
         self.config_data = read_config(); self.index = Index(); self.events = queue.Queue(); self.rows = []
         self.provider = tk.StringVar(value=self.config_data.get("provider", "Ollama"))
@@ -289,6 +330,31 @@ class App(tk.Tk):
         self._build(); self._refresh_folders(); self._refresh_results(); self._poll()
         # Start/check the local Ollama service automatically; no console is shown.
         self.after(900, self.check_models)
+
+    def _configure_styles(self):
+        style = ttk.Style(self)
+        try: style.theme_use("clam")
+        except tk.TclError: pass
+        bg, panel, text, muted, accent = "#f3f5f9", "#ffffff", "#1f2937", "#64748b", "#4f46e5"
+        self.configure(background=bg)
+        style.configure(".", font=("Segoe UI", 10), background=bg, foreground=text)
+        style.configure("TFrame", background=bg)
+        style.configure("Surface.TFrame", background=panel)
+        style.configure("Sidebar.TFrame", background="#e9edf5")
+        style.configure("TLabel", background=bg, foreground=text)
+        style.configure("Muted.TLabel", background=bg, foreground=muted)
+        style.configure("Title.TLabel", background=bg, foreground="#111827", font=("Segoe UI Semibold", 12))
+        style.configure("TButton", padding=(11, 7), background=panel, foreground=text, borderwidth=0)
+        style.map("TButton", background=[("active", "#e2e8f0"), ("pressed", "#cbd5e1")])
+        style.configure("Accent.TButton", padding=(13, 8), background=accent, foreground="#ffffff", font=("Segoe UI Semibold", 10))
+        style.map("Accent.TButton", background=[("active", "#4338ca"), ("pressed", "#3730a3"), ("disabled", "#a5b4fc")])
+        style.configure("TEntry", padding=7, fieldbackground=panel)
+        style.configure("TCombobox", padding=6, fieldbackground=panel, background=panel)
+        style.configure("TNotebook", background=bg, borderwidth=0)
+        style.configure("TNotebook.Tab", padding=(16, 9), background="#e9edf5", foreground=muted)
+        style.map("TNotebook.Tab", background=[("selected", panel)], foreground=[("selected", accent)])
+        style.configure("Treeview", rowheight=27, background=panel, fieldbackground=panel, foreground=text)
+        style.configure("Treeview.Heading", padding=7, background="#e9edf5", foreground=text, font=("Segoe UI Semibold", 9))
 
     def _build(self):
         self.columnconfigure(0, weight=1); self.rowconfigure(1, weight=1)
@@ -568,8 +634,9 @@ class App(tk.Tk):
         main = ttk.Frame(outer); main.columnconfigure(0, weight=1); main.rowconfigure(3, weight=1)
         outer.add(sidebar, weight=1); outer.add(main, weight=4)
         ttk.Label(sidebar, text="История чатов", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, sticky="w", pady=(0,6))
-        ttk.Button(sidebar, text="＋ Новый чат", command=self.new_chat).grid(row=1, column=0, sticky="ew", pady=(0,6))
+        ttk.Button(sidebar, text="＋ Новый чат", command=self.new_chat, style="Accent.TButton").grid(row=1, column=0, sticky="ew", pady=(0,6))
         self.chat_listbox = tk.Listbox(sidebar, exportselection=False, activestyle="dotbox", font=("Segoe UI", 10))
+        self.chat_listbox.configure(background="#e9edf5", foreground="#334155", selectbackground="#c7d2fe", selectforeground="#1e1b4b", borderwidth=0, highlightthickness=0)
         self.chat_listbox.grid(row=2, column=0, sticky="nsew"); self.chat_listbox.bind("<<ListboxSelect>>", self._select_chat_from_list)
         chat_scroll = ttk.Scrollbar(sidebar, orient="vertical", command=self.chat_listbox.yview); chat_scroll.grid(row=2, column=1, sticky="ns")
         self.chat_listbox.configure(yscrollcommand=chat_scroll.set)
@@ -606,23 +673,23 @@ class App(tk.Tk):
         ttk.Button(tree_actions, text="Прикрепить выбранный", command=self.attach_project_file).pack(side="left", padx=2)
         transcript = ttk.Frame(body); transcript.columnconfigure(0, weight=1); transcript.rowconfigure(0, weight=1)
         body.add(transcript, weight=4); self.chat_body = body
-        self.chat_display = tk.Text(transcript, wrap="word", state="disabled", font=("Segoe UI", 11), padx=14, pady=12)
+        self.chat_display = tk.Text(transcript, wrap="word", state="disabled", font=("Segoe UI", 11), padx=20, pady=16, background="#ffffff", foreground="#1f2937", insertbackground="#4f46e5", selectbackground="#c7d2fe", borderwidth=0, highlightthickness=0)
         self.chat_display.grid(row=0, column=0, sticky="nsew")
         chat_history_scroll = ttk.Scrollbar(transcript, orient="vertical", command=self.chat_display.yview)
         chat_history_scroll.grid(row=0, column=1, sticky="ns"); self.chat_display.configure(yscrollcommand=chat_history_scroll.set)
-        self.chat_display.tag_configure("user", foreground="#174ea6", spacing1=12, spacing3=10, font=("Segoe UI", 10, "bold"))
-        self.chat_display.tag_configure("assistant", foreground="#202124", spacing1=10, spacing3=18)
-        self.chat_display.tag_configure("system", foreground="#5f6368", spacing1=8, spacing3=8)
+        self.chat_display.tag_configure("user", foreground="#4338ca", spacing1=14, spacing3=7, font=("Segoe UI Semibold", 10, "bold"))
+        self.chat_display.tag_configure("assistant", foreground="#1f2937", spacing1=9, spacing3=18)
+        self.chat_display.tag_configure("system", foreground="#64748b", spacing1=8, spacing3=8)
         foot = ttk.Frame(main, padding=8); foot.grid(row=4, column=0, sticky="ew"); foot.columnconfigure(0, weight=1)
         self.attached_label = tk.StringVar(value="Файл не прикреплён")
         ttk.Label(foot, textvariable=self.attached_label).grid(row=0, column=0, sticky="w")
         attachment_actions = ttk.Frame(foot); attachment_actions.grid(row=0, column=1, padx=4)
         ttk.Button(attachment_actions, text="Прикрепить файлы…", command=self.attach_chat_file).pack(side="left", padx=2)
         ttk.Button(attachment_actions, text="Очистить вложения", command=self.clear_chat_files).pack(side="left", padx=2)
-        self.chat_input = tk.Text(foot, height=4, wrap="word", font=("Segoe UI", 10))
+        self.chat_input = tk.Text(foot, height=4, wrap="word", font=("Segoe UI", 10), padx=10, pady=8, background="#ffffff", foreground="#1f2937", insertbackground="#4f46e5", selectbackground="#c7d2fe", borderwidth=1, relief="solid", highlightthickness=1, highlightbackground="#d7ddea", highlightcolor="#818cf8")
         self.chat_input.grid(row=1, column=0, sticky="ew", pady=6); self.chat_input.bind("<Return>", self._chat_enter)
         controls = ttk.Frame(foot); controls.grid(row=1, column=1, sticky="se", padx=4)
-        self.chat_send_button = ttk.Button(controls, text="Отправить", command=self.send_chat); self.chat_send_button.pack(fill="x", pady=2)
+        self.chat_send_button = ttk.Button(controls, text="Отправить", command=self.send_chat, style="Accent.TButton"); self.chat_send_button.pack(fill="x", pady=2)
         self.chat_edit_button = ttk.Button(controls, text="Подготовить правку", command=self.prepare_edit); self.chat_edit_button.pack(fill="x", pady=2)
         self.chat_save_button = ttk.Button(controls, text="Сохранить ответ как файл…", command=self.save_chat_answer, state="disabled"); self.chat_save_button.pack(fill="x", pady=2)
         ttk.Label(foot, text="Enter — отправить · Shift+Enter — новая строка · Файлы передаются локальной модели, сохранение ответа выполняется вами.").grid(row=2, column=0, columnspan=2, sticky="w")
@@ -681,7 +748,9 @@ class App(tk.Tk):
     def attach_chat_file(self):
         if self.chat_busy: return
         initial = self.chat_working_dir if Path(self.chat_working_dir).is_dir() else str(Path.home())
-        chosen = filedialog.askopenfilenames(title="Прикрепите текстовые или офисные файлы", initialdir=initial)
+        chosen = filedialog.askopenfilenames(title="Прикрепите текстовые или офисные файлы", initialdir=initial,
+            filetypes=[("Все поддерживаемые", "*.txt *.md *.csv *.json *.py *.docx *.xlsx *.xlsm *.xlsb *.xls *.pptx *.odt *.ods *.odp *.pdf"),
+                       ("Книги Excel", "*.xlsx *.xlsm *.xlsb *.xls"), ("Документы Word", "*.docx"), ("Все файлы", "*.*")])
         if not chosen: return
         skipped = []
         for raw_path in chosen:
@@ -704,6 +773,8 @@ class App(tk.Tk):
             if path.stat().st_size > 50_000_000: return False, "больше 50 МБ"
             text = extract_text(path)
         except OSError: return False, "не удалось прочитать файл"
+        if text.startswith("[Для чтения "):
+            return False, text[1:-1]
         if not text or text.startswith("[Для извлечения текста из PDF"):
             return False, "текст не извлечён"
         remaining = 80000 - sum(len(item["text"]) for item in self.chat_attachments)

@@ -12,7 +12,7 @@ The app connects to a local Ollama service at `127.0.0.1:11434` or LM Studio's O
 
 ## Organization and office files
 
-Organization suggestions do not modify files. The user selects a file and invokes a move or rename action separately. No delete operation exists, and the model has no file-system tools. Text and source-code edits show a diff first; replacing the source requires explicit confirmation and a timestamped backup. DOCX edits are limited to selected paragraph text and retain the rest of the Office package. XLSX, PPTX and OpenDocument files are indexed and opened in the installed office application; their structure is not rewritten.
+Organization suggestions do not modify files. The user selects a file and invokes a move or rename action separately. No delete operation exists, and the model has no file-system tools. Text and source-code edits show a diff first; replacing the source requires explicit confirmation and a timestamped backup. DOCX edits are limited to selected paragraph text and retain the rest of the Office package. XLS, XLSX, XLSM and XLSB files are indexed and can be attached to chat for text extraction; their structure is not rewritten.
 
 ## Checks
 
