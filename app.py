@@ -25,10 +25,10 @@ import tkinter as tk
 import xml.etree.ElementTree as ET
 
 APP_NAME = "Локальный файловый менеджер"
-SUPPORTED = {".txt", ".md", ".rst", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".py", ".js", ".ts", ".css", ".log", ".ini", ".yaml", ".yml", ".toml", ".rtf", ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".pdf"}
+SUPPORTED = {".txt", ".md", ".rst", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".py", ".js", ".ts", ".css", ".log", ".ini", ".yaml", ".yml", ".toml", ".rtf", ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".pdf", ".sql", ".sh", ".ps1", ".bat", ".cs", ".java", ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".jsx", ".tsx", ".vue", ".svelte", ".php", ".rb", ".swift", ".kt", ".properties", ".env"}
 MAX_TEXT = 500_000
 OLLAMA_URL = "http://127.0.0.1:11434"
-EDITABLE_TEXT = {".txt", ".md", ".rst", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".py", ".js", ".ts", ".css", ".log", ".ini", ".yaml", ".yml", ".toml"}
+EDITABLE_TEXT = {".txt", ".md", ".rst", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".py", ".js", ".ts", ".css", ".log", ".ini", ".yaml", ".yml", ".toml", ".sql", ".sh", ".ps1", ".bat", ".cs", ".java", ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".jsx", ".tsx", ".vue", ".svelte", ".php", ".rb", ".swift", ".kt", ".properties", ".env"}
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
 
@@ -279,7 +279,13 @@ class App(tk.Tk):
         self.config_data = read_config(); self.index = Index(); self.events = queue.Queue(); self.rows = []
         self.provider = tk.StringVar(value=self.config_data.get("provider", "Ollama"))
         self.endpoint = tk.StringVar(value=self.config_data.get("endpoint", OLLAMA_URL))
-        self.chat_history = []; self.chat_context = ""; self.chat_window = None; self.chat_busy = False
+        self.chats = self._read_chats(); self.active_chat_id = None
+        self.chat_history = []; self.chat_attachments = []; self.chat_window = None; self.chat_busy = False
+        self.chat_mode_var = tk.StringVar(value="Обычный чат"); self.goal_var = tk.StringVar(value="")
+        self.chat_edit_path = None
+        self.chat_working_dir = self.config_data.get("chat_working_dir", "")
+        if self.chat_working_dir and not Path(self.chat_working_dir).is_dir(): self.chat_working_dir = ""
+        self.last_assistant_answer = ""
         self._build(); self._refresh_folders(); self._refresh_results(); self._poll()
         # Start/check the local Ollama service automatically; no console is shown.
         self.after(900, self.check_models)
@@ -292,7 +298,12 @@ class App(tk.Tk):
         ttk.Button(bar, text="Добавить папку", command=self.add_folder).grid(row=0, column=2, padx=3)
         ttk.Button(bar, text="Убрать", command=self.remove_folder).grid(row=0, column=3, padx=3)
         ttk.Button(bar, text="Сканировать", command=self.scan).grid(row=0, column=4, padx=3)
-        body = ttk.Panedwindow(self, orient="horizontal"); body.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0,10))
+        self.main_notebook = ttk.Notebook(self); self.main_notebook.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0,10))
+        self.files_tab = ttk.Frame(self.main_notebook); self.chat_tab = ttk.Frame(self.main_notebook)
+        self.main_notebook.add(self.files_tab, text="Файлы и поиск")
+        self.main_notebook.add(self.chat_tab, text="Чат")
+        body = ttk.Panedwindow(self.files_tab, orient="horizontal"); body.grid(row=0, column=0, sticky="nsew")
+        self.files_tab.columnconfigure(0, weight=1); self.files_tab.rowconfigure(0, weight=1)
         left = ttk.Frame(body, padding=6); left.columnconfigure(0, weight=1); left.rowconfigure(2, weight=1); body.add(left, weight=3)
         search = ttk.Frame(left); search.grid(row=0, column=0, sticky="ew"); search.columnconfigure(0, weight=1)
         self.query = tk.StringVar(); ent = ttk.Entry(search, textvariable=self.query); ent.grid(row=0, column=0, sticky="ew"); ent.bind("<Return>", lambda e: self._refresh_results())
@@ -326,6 +337,8 @@ class App(tk.Tk):
         ttk.Button(right, text="Предложить сортировку", command=self.organize_ai).grid(row=10, column=0, sticky="ew", pady=5)
         ttk.Label(right, text="* Для PDF-поиска установите pypdf. Ollama: порт 11434. LM Studio: обычно 1234/v1.", wraplength=370).grid(row=11, column=0, sticky="w", pady=5)
         self.status = tk.StringVar(value="Добавьте папку и нажмите «Сканировать»."); ttk.Label(self, textvariable=self.status, relief="sunken", anchor="w", padding=4).grid(row=2, column=0, sticky="ew")
+        self._build_chat_ui(self.chat_tab)
+        self.main_notebook.select(self.chat_tab)
 
     def _refresh_folders(self): self.folder_var.set("; ".join(self.config_data["folders"]) or "Папки не выбраны")
     def _provider_changed(self, _event=None):
@@ -436,35 +449,189 @@ class App(tk.Tk):
             self.events.put("Готово")
         threading.Thread(target=work, daemon=True).start()
     def open_chat(self):
-        if self.chat_window and self.chat_window.winfo_exists():
-            self.chat_window.lift(); return
-        win = self.chat_window = tk.Toplevel(self)
-        win.title("Локальный ИИ — чат"); win.geometry("850x720"); win.minsize(650, 520)
-        win.columnconfigure(0, weight=1); win.rowconfigure(1, weight=1)
-        head = ttk.Frame(win, padding=8); head.grid(row=0, column=0, sticky="ew"); head.columnconfigure(1, weight=1)
-        ttk.Label(head, text="Модель:").grid(row=0, column=0)
-        self.chat_model_box = ttk.Combobox(head, textvariable=self.model, values=self.model_box.cget("values"), width=22)
-        self.chat_model_box.grid(row=0, column=1, sticky="ew", padx=6); head.columnconfigure(1, weight=1)
+        self.main_notebook.select(self.chat_tab)
+        self.chat_input.focus_set()
+
+    def _read_chats(self):
+        try:
+            chats = json.loads((app_data() / "chats.json").read_text(encoding="utf-8"))
+            return [chat for chat in chats if isinstance(chat, dict) and chat.get("id")]
+        except (OSError, ValueError, TypeError):
+            return []
+
+    def _write_chats(self):
+        (app_data() / "chats.json").write_text(json.dumps(self.chats, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _save_current_chat(self):
+        if not self.active_chat_id: return
+        chat = next((item for item in self.chats if item.get("id") == self.active_chat_id), None)
+        if not chat: return
+        chat.update({"history": self.chat_history, "attachments": self.chat_attachments,
+                     "mode": self.chat_mode_var.get(), "goal": self.goal_var.get(),
+                     "working_dir": self.chat_working_dir, "last_answer": self.last_assistant_answer,
+                     "updated": time.time()})
+        first_user = next((item["content"].strip() for item in self.chat_history if item["role"] == "user"), "")
+        if first_user and chat.get("title") in {None, "Новый чат"}:
+            chat["title"] = first_user.replace("\n", " ")[:48]
+        self._write_chats()
+        if hasattr(self, "chat_listbox"): self._refresh_chat_list(self.active_chat_id)
+
+    def _refresh_chat_list(self, select_id=None):
+        if not hasattr(self, "chat_listbox"): return
+        self._updating_chat_list = True
+        self.chat_listbox.delete(0, "end"); self.chat_list_ids = []
+        for chat in sorted(self.chats, key=lambda item: item.get("updated", 0), reverse=True):
+            self.chat_list_ids.append(chat["id"]); self.chat_listbox.insert("end", chat.get("title") or "Новый чат")
+        chosen = select_id or self.active_chat_id
+        if chosen in self.chat_list_ids:
+            index = self.chat_list_ids.index(chosen); self.chat_listbox.selection_set(index); self.chat_listbox.see(index)
+        self._updating_chat_list = False
+
+    def _select_chat_from_list(self, _event=None):
+        if getattr(self, "_updating_chat_list", False): return
+        if self.chat_busy:
+            self._refresh_chat_list(self.active_chat_id); return
+        selection = self.chat_listbox.curselection()
+        if not selection: return
+        chat_id = self.chat_list_ids[selection[0]]
+        if chat_id == self.active_chat_id: return
+        self._save_current_chat()
+        chat = next((item for item in self.chats if item.get("id") == chat_id), None)
+        if not chat: return
+        self._activate_chat(chat_id)
+
+    def _activate_chat(self, chat_id):
+        chat = next((item for item in self.chats if item.get("id") == chat_id), None)
+        if not chat: return
+        self.active_chat_id = chat_id; self.chat_history = list(chat.get("history", []))
+        self.chat_attachments = list(chat.get("attachments", [])); self.chat_mode_var.set(chat.get("mode", "Обычный чат"))
+        self.goal_var.set(chat.get("goal", "")); self.last_assistant_answer = chat.get("last_answer", "")
+        saved_dir = chat.get("working_dir", self.config_data.get("chat_working_dir", ""))
+        self.chat_working_dir = saved_dir if saved_dir and Path(saved_dir).is_dir() else ""
+        self.chat_folder_label.set(self.chat_working_dir or "Рабочая папка не выбрана")
+        self.chat_edit_path = next((Path(item["path"]) for item in reversed(self.chat_attachments) if item.get("path") and Path(item["path"]).is_file()), None)
+        self.chat_save_button.configure(state="normal" if self.last_assistant_answer else "disabled")
+        self._refresh_chat_list(chat_id); self._update_attachment_label(); self._update_chat_mode_ui(); self._render_chat()
+
+    def _mode_changed(self, _event=None):
+        if self.chat_busy:
+            active = next((item for item in self.chats if item.get("id") == self.active_chat_id), None)
+            self.chat_mode_var.set(active.get("mode", "Обычный чат") if active else "Обычный чат")
+            return
+        self._update_chat_mode_ui(); self._save_current_chat()
+        if self.chat_mode_var.get() == "Работа по цели": self.goal_entry.focus_set()
+
+    def _update_chat_mode_ui(self):
+        if self.chat_mode_var.get() == "Работа по цели": self.goal_bar.grid(row=2, column=0, sticky="ew")
+        else: self.goal_bar.grid_remove()
+        if self.chat_mode_var.get() == "Код проекта":
+            if not self.project_panel.winfo_manager(): self.chat_body.insert(0, self.project_panel, weight=1)
+            if self.chat_working_dir: self.refresh_project_files()
+        elif self.project_panel.winfo_manager():
+            self.chat_body.forget(self.project_panel)
+
+    def _refresh_chat_list_entry(self):
+        self._refresh_chat_list(self.active_chat_id)
+
+    def refresh_project_files(self):
+        self.project_tree.delete(*self.project_tree.get_children()); self.project_paths = {}
+        base = Path(self.chat_working_dir) if self.chat_working_dir else None
+        if not base or not base.is_dir(): return
+        ignored = {".git", ".venv", "venv", "node_modules", "__pycache__", "dist", "build", "target", ".idea"}
+        editable_exts = EDITABLE_TEXT | {".docx"}
+        index = 0
+        for root, dirs, files in os.walk(base):
+            dirs[:] = sorted(d for d in dirs if d not in ignored)
+            for filename in sorted(files):
+                path = Path(root) / filename
+                if path.suffix.lower() not in editable_exts: continue
+                try:
+                    st = path.stat()
+                    if st.st_size > 50_000_000: continue
+                    relative = str(path.relative_to(base))
+                    iid = str(index); index += 1; self.project_paths[iid] = path
+                    self.project_tree.insert("", "end", iid=iid, text=relative, values=(human_size(st.st_size),))
+                    if index >= 1500: return
+                except OSError: continue
+
+    def attach_project_file(self):
+        selection = self.project_tree.selection()
+        if not selection: messagebox.showinfo(APP_NAME, "Выберите файл проекта."); return
+        path = self.project_paths.get(selection[0])
+        if path: self._attach_path(path)
+
+    def _build_chat_ui(self, win):
+        self.chat_window = win
+        win.columnconfigure(0, weight=1); win.rowconfigure(0, weight=1)
+        outer = ttk.Panedwindow(win, orient="horizontal"); outer.grid(row=0, column=0, sticky="nsew")
+        sidebar = ttk.Frame(outer, padding=8); sidebar.columnconfigure(0, weight=1); sidebar.rowconfigure(2, weight=1)
+        main = ttk.Frame(outer); main.columnconfigure(0, weight=1); main.rowconfigure(3, weight=1)
+        outer.add(sidebar, weight=1); outer.add(main, weight=4)
+        ttk.Label(sidebar, text="История чатов", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, sticky="w", pady=(0,6))
+        ttk.Button(sidebar, text="＋ Новый чат", command=self.new_chat).grid(row=1, column=0, sticky="ew", pady=(0,6))
+        self.chat_listbox = tk.Listbox(sidebar, exportselection=False, activestyle="dotbox", font=("Segoe UI", 10))
+        self.chat_listbox.grid(row=2, column=0, sticky="nsew"); self.chat_listbox.bind("<<ListboxSelect>>", self._select_chat_from_list)
+        chat_scroll = ttk.Scrollbar(sidebar, orient="vertical", command=self.chat_listbox.yview); chat_scroll.grid(row=2, column=1, sticky="ns")
+        self.chat_listbox.configure(yscrollcommand=chat_scroll.set)
+        head = ttk.Frame(main, padding=8); head.grid(row=0, column=0, sticky="ew"); head.columnconfigure(1, weight=1)
+        ttk.Label(head, text="Режим:").grid(row=0, column=0)
+        self.chat_mode_box = ttk.Combobox(head, textvariable=self.chat_mode_var, values=["Обычный чат", "Работа по цели", "Код проекта"], state="readonly", width=18)
+        self.chat_mode_box.grid(row=0, column=1, sticky="w", padx=6); self.chat_mode_box.bind("<<ComboboxSelected>>", self._mode_changed)
+        ttk.Label(head, text="Модель:").grid(row=0, column=2)
+        self.chat_model_box = ttk.Combobox(head, textvariable=self.model, values=self.model_box.cget("values"), width=20)
+        self.chat_model_box.grid(row=0, column=3, sticky="ew", padx=6); head.columnconfigure(3, weight=1)
         self.chat_provider_box = ttk.Combobox(head, textvariable=self.provider, values=["Ollama", "LM Studio"], state="readonly", width=12)
-        self.chat_provider_box.grid(row=0, column=2, padx=4); self.chat_provider_box.bind("<<ComboboxSelected>>", self._provider_changed)
-        ttk.Button(head, text="Найти модели", command=self.check_models).grid(row=0, column=3, padx=4)
-        ttk.Button(head, text="Новый чат", command=self.new_chat).grid(row=0, column=4, padx=4)
-        self.chat_display = tk.Text(win, wrap="word", state="disabled", font=("Segoe UI", 11), padx=14, pady=12)
-        self.chat_display.grid(row=1, column=0, sticky="nsew", padx=8)
+        self.chat_provider_box.grid(row=0, column=4, padx=4); self.chat_provider_box.bind("<<ComboboxSelected>>", self._provider_changed)
+        ttk.Button(head, text="Модели", command=self.check_models).grid(row=0, column=5, padx=4)
+        folder_bar = ttk.Frame(main, padding=(8, 0, 8, 6)); folder_bar.grid(row=1, column=0, sticky="ew"); folder_bar.columnconfigure(1, weight=1)
+        ttk.Button(folder_bar, text="Рабочая папка…", command=self.choose_chat_working_dir).grid(row=0, column=0, padx=(0,6))
+        self.chat_folder_label = tk.StringVar(value=self.chat_working_dir or "Рабочая папка не выбрана")
+        ttk.Label(folder_bar, textvariable=self.chat_folder_label).grid(row=0, column=1, sticky="ew")
+        ttk.Button(folder_bar, text="Открыть папку", command=self.open_chat_working_dir).grid(row=0, column=2, padx=6)
+        self.goal_bar = ttk.Frame(main, padding=(8, 0, 8, 6)); self.goal_bar.columnconfigure(1, weight=1)
+        ttk.Label(self.goal_bar, text="Цель:").grid(row=0, column=0, sticky="w")
+        self.goal_entry = ttk.Entry(self.goal_bar, textvariable=self.goal_var)
+        self.goal_entry.grid(row=0, column=1, sticky="ew", padx=6); self.goal_entry.bind("<FocusOut>", lambda _e: self._save_current_chat()); self.goal_entry.bind("<Return>", lambda _e: self._save_current_chat())
+        body = ttk.Panedwindow(main, orient="horizontal"); body.grid(row=3, column=0, sticky="nsew", padx=8)
+        self.project_panel = ttk.Frame(body, padding=6); self.project_panel.columnconfigure(0, weight=1); self.project_panel.rowconfigure(1, weight=1)
+        ttk.Label(self.project_panel, text="Файлы проекта").grid(row=0, column=0, sticky="w")
+        self.project_tree = ttk.Treeview(self.project_panel, columns=("size",), show="tree headings", selectmode="browse")
+        self.project_tree.heading("#0", text="Путь"); self.project_tree.heading("size", text="Размер")
+        self.project_tree.column("#0", width=230); self.project_tree.column("size", width=70)
+        self.project_tree.grid(row=1, column=0, sticky="nsew"); self.project_tree.bind("<Double-1>", lambda _e: self.attach_project_file())
+        project_scroll = ttk.Scrollbar(self.project_panel, orient="vertical", command=self.project_tree.yview); project_scroll.grid(row=1, column=1, sticky="ns")
+        self.project_tree.configure(yscrollcommand=project_scroll.set)
+        tree_actions = ttk.Frame(self.project_panel); tree_actions.grid(row=2, column=0, sticky="ew", pady=4)
+        ttk.Button(tree_actions, text="Обновить", command=self.refresh_project_files).pack(side="left", padx=2)
+        ttk.Button(tree_actions, text="Прикрепить выбранный", command=self.attach_project_file).pack(side="left", padx=2)
+        transcript = ttk.Frame(body); transcript.columnconfigure(0, weight=1); transcript.rowconfigure(0, weight=1)
+        body.add(transcript, weight=4); self.chat_body = body
+        self.chat_display = tk.Text(transcript, wrap="word", state="disabled", font=("Segoe UI", 11), padx=14, pady=12)
+        self.chat_display.grid(row=0, column=0, sticky="nsew")
+        chat_history_scroll = ttk.Scrollbar(transcript, orient="vertical", command=self.chat_display.yview)
+        chat_history_scroll.grid(row=0, column=1, sticky="ns"); self.chat_display.configure(yscrollcommand=chat_history_scroll.set)
         self.chat_display.tag_configure("user", foreground="#174ea6", spacing1=12, spacing3=10, font=("Segoe UI", 10, "bold"))
         self.chat_display.tag_configure("assistant", foreground="#202124", spacing1=10, spacing3=18)
         self.chat_display.tag_configure("system", foreground="#5f6368", spacing1=8, spacing3=8)
-        foot = ttk.Frame(win, padding=8); foot.grid(row=2, column=0, sticky="ew"); foot.columnconfigure(0, weight=1)
+        foot = ttk.Frame(main, padding=8); foot.grid(row=4, column=0, sticky="ew"); foot.columnconfigure(0, weight=1)
         self.attached_label = tk.StringVar(value="Файл не прикреплён")
         ttk.Label(foot, textvariable=self.attached_label).grid(row=0, column=0, sticky="w")
-        ttk.Button(foot, text="Прикрепить выбранный файл", command=self.attach_chat_file).grid(row=0, column=1, padx=4)
+        attachment_actions = ttk.Frame(foot); attachment_actions.grid(row=0, column=1, padx=4)
+        ttk.Button(attachment_actions, text="Прикрепить файлы…", command=self.attach_chat_file).pack(side="left", padx=2)
+        ttk.Button(attachment_actions, text="Очистить вложения", command=self.clear_chat_files).pack(side="left", padx=2)
         self.chat_input = tk.Text(foot, height=4, wrap="word", font=("Segoe UI", 10))
         self.chat_input.grid(row=1, column=0, sticky="ew", pady=6); self.chat_input.bind("<Return>", self._chat_enter)
         controls = ttk.Frame(foot); controls.grid(row=1, column=1, sticky="se", padx=4)
         self.chat_send_button = ttk.Button(controls, text="Отправить", command=self.send_chat); self.chat_send_button.pack(fill="x", pady=2)
         self.chat_edit_button = ttk.Button(controls, text="Подготовить правку", command=self.prepare_edit); self.chat_edit_button.pack(fill="x", pady=2)
-        ttk.Label(foot, text="Enter — отправить · Shift+Enter — новая строка · Правки применяются только после проверки и подтверждения.").grid(row=2, column=0, columnspan=2, sticky="w")
-        self.chat_history = []; self.chat_context = ""; self._render_chat()
+        self.chat_save_button = ttk.Button(controls, text="Сохранить ответ как файл…", command=self.save_chat_answer, state="disabled"); self.chat_save_button.pack(fill="x", pady=2)
+        ttk.Label(foot, text="Enter — отправить · Shift+Enter — новая строка · Файлы передаются локальной модели, сохранение ответа выполняется вами.").grid(row=2, column=0, columnspan=2, sticky="w")
+        self._refresh_chat_list()
+        if self.chats:
+            latest = max(self.chats, key=lambda item: item.get("updated", 0))
+            self._activate_chat(latest["id"])
+        else:
+            self.new_chat()
         self.chat_input.focus_set()
 
     def _chat_enter(self, event):
@@ -475,7 +642,10 @@ class App(tk.Tk):
         if not self.chat_window or not self.chat_window.winfo_exists(): return
         self.chat_display.configure(state="normal"); self.chat_display.delete("1.0", "end")
         if not self.chat_history:
-            self.chat_display.insert("end", "Локальный чат\n\nВыберите локальную модель выше. Можно задавать вопросы, прикреплять файлы и просить модель подготовить правки.\n\nМодель не имеет доступа к файловой системе и не может удалять файлы.", "system")
+            mode_hint = {"Работа по цели": "Опишите цель в поле выше — чат сохранит её и будет помогать двигаться к результату по шагам.",
+                         "Код проекта": "Выберите рабочую папку проекта. Прикрепляйте файлы из дерева слева, задавайте вопросы и просите подготовить правку.",
+                         "Обычный чат": "Задавайте вопросы и прикрепляйте файлы из рабочей папки."}.get(self.chat_mode_var.get(), "Задавайте вопросы.")
+            self.chat_display.insert("end", f"Локальный чат\n\n{mode_hint}\n\nМодель не имеет доступа к файловой системе и не может удалять файлы.", "system")
         for item in self.chat_history:
             label = "Вы" if item["role"] == "user" else "Локальная модель"
             self.chat_display.insert("end", label + "\n", item["role"])
@@ -483,20 +653,88 @@ class App(tk.Tk):
         self.chat_display.configure(state="disabled"); self.chat_display.see("end")
 
     def new_chat(self):
-        self.chat_history = []; self.chat_context = ""; self.attached_label.set("Файл не прикреплён"); self._render_chat()
+        if self.chat_busy: return
+        self._save_current_chat()
+        chat = {"id": uuid.uuid4().hex, "title": "Новый чат", "history": [], "attachments": [],
+                "mode": "Обычный чат", "goal": "", "working_dir": self.chat_working_dir, "updated": time.time()}
+        self.chats.insert(0, chat); self.active_chat_id = chat["id"]
+        self._activate_chat(chat["id"]); self._write_chats()
+        self.chat_input.focus_set()
+
+    def choose_chat_working_dir(self):
+        if self.chat_busy: return
+        initial = self.chat_working_dir if Path(self.chat_working_dir).is_dir() else str(Path.home())
+        folder = filedialog.askdirectory(title="Выберите рабочую папку чата", initialdir=initial)
+        if folder:
+            self.chat_working_dir = str(Path(folder).resolve())
+            self.config_data["chat_working_dir"] = self.chat_working_dir; write_config(self.config_data)
+            self.chat_folder_label.set(self.chat_working_dir)
+            self._save_current_chat()
+            if self.chat_mode_var.get() == "Код проекта": self.refresh_project_files()
+
+    def open_chat_working_dir(self):
+        if not self.chat_working_dir or not Path(self.chat_working_dir).is_dir():
+            messagebox.showinfo(APP_NAME, "Сначала выберите рабочую папку чата."); return
+        try: os.startfile(self.chat_working_dir)
+        except (AttributeError, OSError) as e: messagebox.showerror(APP_NAME, str(e))
 
     def attach_chat_file(self):
-        row = self.selected()
-        if not row:
-            messagebox.showinfo(APP_NAME, "Сначала выберите файл в списке."); return
-        if not row[5]:
-            messagebox.showinfo(APP_NAME, "Для этого типа файла не извлечён текст."); return
-        self.chat_context = f"Прикреплённый файл: {row[0]}\nТекст файла:\n{row[5][:30000]}"
-        self.attached_label.set(Path(row[0]).name + " — текст передаётся только локальной модели")
+        if self.chat_busy: return
+        initial = self.chat_working_dir if Path(self.chat_working_dir).is_dir() else str(Path.home())
+        chosen = filedialog.askopenfilenames(title="Прикрепите текстовые или офисные файлы", initialdir=initial)
+        if not chosen: return
+        skipped = []
+        for raw_path in chosen:
+            ok, reason = self._attach_path(Path(raw_path))
+            if not ok: skipped.append(Path(raw_path).name + " (" + reason + ")")
+        if skipped: messagebox.showwarning("Некоторые файлы не прикреплены", "\n".join(skipped))
+
+    def _attach_path(self, path: Path):
+        if self.chat_busy: return False, "дождитесь завершения запроса"
+        path = path.resolve()
+        if len(self.chat_attachments) >= 8: return False, "лимит 8 файлов"
+        if any(item.get("path") == str(path) for item in self.chat_attachments):
+            self.chat_edit_path = path; return True, ""
+        if path.suffix.lower() not in SUPPORTED: return False, "формат не поддерживается"
+        if self.chat_mode_var.get() == "Код проекта":
+            if not self.chat_working_dir: return False, "сначала задайте рабочую папку проекта"
+            try: path.relative_to(Path(self.chat_working_dir).resolve())
+            except ValueError: return False, "в режиме кода разрешены только файлы из рабочей папки"
+        try:
+            if path.stat().st_size > 50_000_000: return False, "больше 50 МБ"
+            text = extract_text(path)
+        except OSError: return False, "не удалось прочитать файл"
+        if not text or text.startswith("[Для извлечения текста из PDF"):
+            return False, "текст не извлечён"
+        remaining = 80000 - sum(len(item["text"]) for item in self.chat_attachments)
+        if remaining <= 0: return False, "общий лимит контекста 80 000 символов"
+        attached = text[:remaining]
+        self.chat_attachments.append({"name": path.name, "path": str(path), "text": attached, "truncated": len(attached) < len(text)})
+        self.chat_edit_path = path; self._update_attachment_label(); self._save_current_chat()
+        return True, ""
+
+    def _update_attachment_label(self):
+        names = [item["name"] + (" (обрезан по лимиту)" if item.get("truncated") else "") for item in self.chat_attachments]
+        self.attached_label.set("Вложения: " + (", ".join(names) if names else "нет"))
+
+    def clear_chat_files(self):
+        if self.chat_busy: return
+        self.chat_attachments = []; self.chat_edit_path = None
+        self._update_attachment_label(); self._save_current_chat()
 
     def _chat_messages(self):
         system = "Ты помощник в локальном файловом менеджере. Отвечай на языке пользователя. У тебя нет инструментов и доступа к диску: ты не можешь перемещать, создавать или удалять файлы. Для правки верни полный текст изменённого файла по явному запросу пользователя; приложение покажет его и попросит подтверждение."
-        if self.chat_context: system += "\n\n" + self.chat_context
+        if self.chat_mode_var.get() == "Работа по цели":
+            goal = self.goal_var.get().strip()
+            system += "\nРежим работы по цели: помогай последовательно достигать явно указанной цели, предлагай следующий конкретный шаг и учитывай предыдущие сообщения."
+            if goal: system += "\nЦель пользователя: " + goal
+        elif self.chat_mode_var.get() == "Код проекта":
+            system += "\nРежим кода проекта: анализируй только явно приложенные файлы. Помогай с кодом и предлагай точные правки. Рабочая папка не означает автоматический доступ к другим файлам проекта."
+            if self.chat_working_dir: system += "\nРабочий проект: " + Path(self.chat_working_dir).name
+        if self.chat_attachments:
+            system += "\n\nПользователь передал содержимое файлов только для этой беседы. Рабочая папка чата: " + (Path(self.chat_working_dir).name if self.chat_working_dir else "не выбрана")
+            for item in self.chat_attachments:
+                system += f"\n\n--- Вложение: {item['name']} ---\n{item['text']}"
         return [{"role": "system", "content": system}] + self.chat_history
 
     def send_chat(self):
@@ -504,14 +742,31 @@ class App(tk.Tk):
         prompt = self.chat_input.get("1.0", "end-1c").strip()
         if not prompt: return
         self.chat_input.delete("1.0", "end"); self.chat_history.append({"role": "user", "content": prompt}); self._render_chat()
+        self._save_current_chat()
         self._run_chat(self._chat_messages(), purpose="chat")
+
+    def save_chat_answer(self):
+        if not self.last_assistant_answer:
+            messagebox.showinfo(APP_NAME, "В чате ещё нет ответа для сохранения."); return
+        initial = self.chat_working_dir if Path(self.chat_working_dir).is_dir() else str(Path.home())
+        name = "ответ.md"
+        path = filedialog.asksaveasfilename(title="Сохранить ответ модели как файл", initialdir=initial, initialfile=name,
+                                            defaultextension=".md", filetypes=[("Markdown", "*.md"), ("Текст", "*.txt"), ("Все файлы", "*.*")])
+        if not path: return
+        target = Path(path)
+        if target.exists() and not messagebox.askyesno("Подтвердить замену", f"Файл уже существует:\n{target}\n\nЗаменить его содержимое?"):
+            return
+        try:
+            target.write_text(self.last_assistant_answer, encoding="utf-8")
+            messagebox.showinfo(APP_NAME, f"Ответ сохранён:\n{target}")
+        except OSError as e: messagebox.showerror(APP_NAME, f"Не удалось сохранить файл:\n{e}")
 
     def prepare_edit(self):
         if self.chat_busy: return
         row = self.selected()
-        if not row:
+        if not row and not (self.chat_edit_path and self.chat_edit_path.is_file()):
             messagebox.showinfo(APP_NAME, "Выберите файл в списке, затем попросите изменить его."); return
-        path = Path(row[0]); ext = path.suffix.lower()
+        path = (self.chat_edit_path if self.chat_edit_path and self.chat_edit_path.is_file() else Path(row[0] if row else "")); ext = path.suffix.lower()
         edit_kind = "docx" if ext == ".docx" else "text"
         if ext not in EDITABLE_TEXT and edit_kind != "docx":
             messagebox.showinfo(APP_NAME, "Правки поддерживаются для текста, исходного кода и Word DOCX. Для других Office-файлов доступен чат по содержимому, без перезаписи книги или презентации."); return
@@ -587,9 +842,13 @@ class App(tk.Tk):
                 if not edited: self._chat_error("Модель вернула пустой документ."); return
                 if len(edited) > 75000: self._chat_error("Ответ модели длиннее безопасного лимита для правки (75 000 символов)."); return
             self.chat_history.append({"role": "assistant", "content": "Подготовлены правки для проверки. Исходный файл пока не изменён."}); self._render_chat()
+            self._save_current_chat()
             self._show_edit_preview(edit_path, original, edited, edit_kind, edit_encoding)
         else:
+            self.last_assistant_answer = answer
+            if self.chat_window and self.chat_window.winfo_exists(): self.chat_save_button.configure(state="normal")
             self.chat_history.append({"role": "assistant", "content": answer}); self._render_chat()
+            self._save_current_chat()
 
     def _chat_error(self, error):
         self.chat_busy = False
