@@ -6,6 +6,8 @@ The user explicitly chooses the folders to index. The index is stored in `%APPDA
 
 ## Local model connection
 
+The main window opens on the chat tab and keeps a local chat list. Chats can use normal, goal, or project-code mode. The working folder is per chat. Attachments and conversation content are persisted locally in `%APPDATA%\LocalFileManager\chats.json`.
+
 The app connects to a local Ollama service at `127.0.0.1:11434` or LM Studio's OpenAI-compatible API, usually `http://127.0.0.1:1234/v1`. On startup it tries Ollama and may launch the installed service without opening a console. File contents are sent only to the selected localhost model when the user asks for an AI operation.
 
 ## Organization and office files
@@ -14,4 +16,4 @@ Organization suggestions do not modify files. The user selects a file and invoke
 
 ## Checks
 
-After changing the app, verify syntax and content search, then exercise chat and text/DOCX edit previews using temporary files. Launch through the desktop shortcut and confirm the local model returns a response. Review filesystem operations to ensure the model still has no way to delete files; do not use real user documents for smoke edits.
+After changing the app, verify syntax and content search, then exercise the visible chat, saved chat list, goal/code modes, attachments, save-as, and text/DOCX edit previews using temporary files. Launch through the desktop shortcut and confirm the local model returns a response. Review filesystem operations to ensure the model still has no way to delete files; do not use real user documents for smoke edits.
