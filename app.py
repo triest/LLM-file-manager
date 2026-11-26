@@ -641,6 +641,29 @@ def compact_chat_messages(messages: list[dict], max_chars=90000):
     return compacted, original_chars, sent_chars
 
 
+def split_model_reasoning(answer: str) -> tuple[str, str]:
+    """Separate common reasoning-channel markers from the user-facing answer."""
+    text = str(answer or "").replace("[end of text]", "").strip()
+    reasoning = []
+    # DeepSeek R1 commonly ends its reasoning with this literal marker.
+    marker = re.search(r"\[\s*end\s+thinking\s*\]", text, re.IGNORECASE)
+    if marker:
+        reasoning.append(text[:marker.start()].strip())
+        text = text[marker.end():].strip()
+
+    # Also handle models that emit explicit XML-style thought/analysis tags.
+    tag_pattern = re.compile(r"(?:<(think|thinking|analysis)>(.*?)</\1\s*>|<\|think\|>(.*?)<\|/think\|>)", re.IGNORECASE | re.DOTALL)
+    while True:
+        match = tag_pattern.search(text)
+        if not match:
+            break
+        reasoning.append((match.group(2) or match.group(3) or "").strip())
+        text = (text[:match.start()] + text[match.end():]).strip()
+    text = re.sub(r"</?(?:think|thinking|analysis)\s*>|<\|/?think\|>", "", text, flags=re.IGNORECASE).strip()
+    reasoning = [part for part in reasoning if part]
+    return text, "\n\n".join(reasoning)
+
+
 def _is_model_runtime_artifact(message: dict) -> bool:
     """Do not feed prior runtime errors or llama.cpp banners back as conversation turns."""
     if message.get("role") != "assistant": return False
@@ -2266,7 +2289,12 @@ class App(tk.Tk):
                 display.insert("end", f"Локальный чат\n\n{mode_hint}\n\nМодель не имеет доступа к файловой системе и не может удалять файлы.", "system")
             for item in self.chat_history:
                 label = "Вы" if item["role"] == "user" else "Локальная модель"
-                display.insert("end", label + "\n", item["role"]); display.insert("end", item["content"] + "\n\n", item["role"])
+                display.insert("end", label + "\n", item["role"])
+                if item["role"] == "assistant" and item.get("reasoning"):
+                    display.insert("end", "Размышления модели\n", "system")
+                    display.insert("end", item["reasoning"] + "\n\n", "system")
+                    display.insert("end", "Ответ\n", "assistant")
+                display.insert("end", item["content"] + "\n\n", item["role"])
             display.configure(state="disabled"); display.see("end")
 
     def new_chat(self):
@@ -2578,23 +2606,29 @@ class App(tk.Tk):
         self.active_request_purpose = None; self.active_request_chat_id = None
         self._sync_chat_controls()
         self.status.set("Ответ получен от локальной модели")
+        final_answer, reasoning = split_model_reasoning(answer)
+        if not final_answer:
+            self._chat_error("Модель завершила рассуждение, но не вернула финальный ответ. Уточните запрос и попробуйте ещё раз.", request_chat_id)
+            return
         if purpose != "edit" and request_chat_id and request_chat_id != self.active_chat_id:
             chat = next((item for item in self.chats if item.get("id") == request_chat_id), None)
             if chat is not None:
-                chat.setdefault("history", []).append({"role": "assistant", "content": answer})
-                chat["last_answer"] = answer; chat["unread"] = True; chat["updated"] = time.time()
+                message = {"role": "assistant", "content": final_answer}
+                if reasoning: message["reasoning"] = reasoning
+                chat.setdefault("history", []).append(message)
+                chat["last_answer"] = final_answer; chat["unread"] = True; chat["updated"] = time.time()
                 self._write_chats(); self._notify_chat_unread(chat)
                 return
         if purpose == "edit":
             if edit_kind == "excel":
                 try:
-                    plan = extract_json_object(answer)
+                    plan = extract_json_object(final_answer)
                     edited = validate_excel_operations(edit_path, plan)
                 except (ValueError, TypeError, KeyError, json.JSONDecodeError, ImportError, OSError) as e:
                     self._chat_error(f"Не удалось подготовить изменения Excel: {e}"); return
             elif edit_kind == "docx":
                 try:
-                    plan = extract_json_object(answer)
+                    plan = extract_json_object(final_answer)
                     by_id = {p["id"]: p for p in original}; changes = []
                     seen = set()
                     for item in plan.get("changes", []):
@@ -2610,7 +2644,7 @@ class App(tk.Tk):
                 except (ValueError, TypeError, KeyError, json.JSONDecodeError) as e:
                     self._chat_error(f"Не удалось разобрать план правок DOCX: {e}. Попробуйте ещё раз или выберите другую модель."); return
             else:
-                edited = answer.strip()
+                edited = final_answer.strip()
                 if edited.startswith("```") and edited.endswith("```"):
                     edited = edited.split("\n", 1)[1].rsplit("```", 1)[0].rstrip()
                 if not edited: self._chat_error("Модель вернула пустой документ."); return
@@ -2619,9 +2653,11 @@ class App(tk.Tk):
             self._save_current_chat()
             self._show_edit_preview(edit_path, original, edited, edit_kind, edit_encoding)
         else:
-            self.last_assistant_answer = answer
+            self.last_assistant_answer = final_answer
             self._sync_chat_controls()
-            self.chat_history.append({"role": "assistant", "content": answer}); self._render_chat()
+            message = {"role": "assistant", "content": final_answer}
+            if reasoning: message["reasoning"] = reasoning
+            self.chat_history.append(message); self._render_chat()
             self._save_current_chat()
 
     def _chat_error(self, error, request_chat_id=None):
