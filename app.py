@@ -677,6 +677,7 @@ class App(tk.Tk):
         self.project_file_path = None
         self.chat_working_dir = self.config_data.get("chat_working_dir", "")
         if self.chat_working_dir and not Path(self.chat_working_dir).is_dir(): self.chat_working_dir = ""
+        self.chat_project_dirs = [self.chat_working_dir] if self.chat_working_dir else []
         self.last_assistant_answer = ""
         self._build(); self._refresh_folders(); self._refresh_results(); self._poll()
         self.after(500, self._ensure_runtime)
@@ -766,6 +767,7 @@ class App(tk.Tk):
         self.status = tk.StringVar(value="Добавьте папку и нажмите «Сканировать»."); ttk.Label(self, textvariable=self.status, style="Status.TLabel", anchor="w").grid(row=2, column=0, sticky="ew")
         self._build_chat_ui(self.chat_tab)
         self._build_cursor_tab()
+        self.main_notebook.bind("<<NotebookTabChanged>>", self._main_tab_changed)
         self.main_notebook.select(self.chat_tab)
 
     def _refresh_folders(self): self.folder_var.set("; ".join(self.config_data["folders"]) or "Папки не выбраны")
@@ -787,11 +789,17 @@ class App(tk.Tk):
         tab = self.cursor_tab
         tab.columnconfigure(0, weight=1); tab.rowconfigure(1, weight=1)
         toolbar = ttk.Frame(tab, padding=10); toolbar.grid(row=0, column=0, sticky="ew"); toolbar.columnconfigure(1, weight=1)
-        ttk.Label(toolbar, text="Проект:").grid(row=0, column=0, padx=(0, 6))
+        ttk.Label(toolbar, text="Проекты:").grid(row=0, column=0, padx=(0, 6))
         self.cursor_folder_label = tk.StringVar(value=self.chat_working_dir or "Выберите рабочую папку проекта")
-        ttk.Label(toolbar, textvariable=self.cursor_folder_label, style="Muted.TLabel").grid(row=0, column=1, sticky="w")
-        RoundedButton(toolbar, text="Выбрать папку…", command=self.choose_chat_working_dir).grid(row=0, column=2, padx=4)
-        RoundedButton(toolbar, text="Обновить", command=self.refresh_cursor_files).grid(row=0, column=3, padx=4)
+        self.cursor_project_box = ttk.Combobox(toolbar, textvariable=self.cursor_folder_label, state="readonly")
+        self.cursor_project_box.grid(row=0, column=1, sticky="ew", padx=4); self.cursor_project_box.bind("<<ComboboxSelected>>", self._select_cursor_project)
+        RoundedButton(toolbar, text="＋ Проект", command=self.add_cursor_project).grid(row=0, column=2, padx=4)
+        ttk.Label(toolbar, text="Чат:").grid(row=0, column=3, padx=(10, 2))
+        self.cursor_chat_var = tk.StringVar()
+        self.cursor_chat_box = ttk.Combobox(toolbar, textvariable=self.cursor_chat_var, state="readonly", width=24)
+        self.cursor_chat_box.grid(row=0, column=4, padx=4); self.cursor_chat_box.bind("<<ComboboxSelected>>", self._select_cursor_chat)
+        RoundedButton(toolbar, text="＋ Чат", command=self.new_chat).grid(row=0, column=5, padx=4)
+        RoundedButton(toolbar, text="Обновить", command=self.refresh_cursor_files).grid(row=0, column=6, padx=4)
         split = ttk.Panedwindow(tab, orient="horizontal"); split.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 8))
         left = ttk.Frame(split, padding=6); left.columnconfigure(0, weight=1); left.rowconfigure(0, weight=1)
         self.cursor_tree = ttk.Treeview(left, columns=("size",), show="tree headings", selectmode="browse")
@@ -799,37 +807,110 @@ class App(tk.Tk):
         self.cursor_tree.column("#0", width=300); self.cursor_tree.column("size", width=90)
         self.cursor_tree.grid(row=0, column=0, sticky="nsew"); self.cursor_tree.bind("<<TreeviewSelect>>", self._preview_cursor_file)
         left_scroll = ttk.Scrollbar(left, orient="vertical", command=self.cursor_tree.yview); left_scroll.grid(row=0, column=1, sticky="ns"); self.cursor_tree.configure(yscrollcommand=left_scroll.set)
-        right = ttk.Frame(split, padding=6); right.columnconfigure(0, weight=1); right.rowconfigure(1, weight=1)
-        ttk.Label(right, text="Предпросмотр выбранного файла", style="Title.TLabel").grid(row=0, column=0, sticky="w")
-        self.cursor_preview = tk.Text(right, wrap="none", state="disabled", font=("Cascadia Code", 10), background="#ffffff", foreground="#374151", insertbackground="#202123", borderwidth=0, padx=12, pady=10)
+        center = ttk.Frame(split, padding=6); center.columnconfigure(0, weight=1); center.rowconfigure(1, weight=1)
+        ttk.Label(center, text="Код проекта", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        self.cursor_preview = tk.Text(center, wrap="none", state="disabled", font=("Cascadia Code", 10), background="#ffffff", foreground="#374151", insertbackground="#202123", borderwidth=0, padx=12, pady=10)
         self.cursor_preview.grid(row=1, column=0, sticky="nsew", pady=6)
-        preview_scroll = ttk.Scrollbar(right, orient="vertical", command=self.cursor_preview.yview); preview_scroll.grid(row=1, column=1, sticky="ns"); self.cursor_preview.configure(yscrollcommand=preview_scroll.set)
-        ttk.Label(right, text="Модель для задач:").grid(row=2, column=0, sticky="w", pady=(4, 2))
-        model_row = ttk.Frame(right); model_row.grid(row=3, column=0, sticky="ew"); model_row.columnconfigure(0, weight=1)
-        self.cursor_model_box = ttk.Combobox(model_row, textvariable=self.model, values=tuple(self.model_catalog), state="readonly")
-        self.cursor_model_box.grid(row=0, column=0, sticky="ew"); self.cursor_model_box.bind("<<ComboboxSelected>>", self._model_changed)
-        RoundedButton(model_row, text="Обновить", command=self.check_models).grid(row=0, column=1, padx=4)
-        RoundedButton(model_row, text="Добавить GGUF…", command=self._select_model_from_files).grid(row=0, column=2, padx=4)
-        task = ttk.Frame(tab, padding=(10, 0, 10, 10)); task.grid(row=2, column=0, sticky="ew"); task.columnconfigure(0, weight=1)
-        ttk.Label(task, text="Опишите, что нужно сделать с выбранным файлом. Перед сохранением приложение покажет diff и запросит подтверждение.").grid(row=0, column=0, sticky="w")
-        self.cursor_task_input = tk.Text(task, height=3, wrap="word", font=("Segoe UI", 10), background="#ffffff", foreground="#202123", insertbackground="#202123", selectbackground="#dff3ed", borderwidth=1, relief="solid", highlightthickness=1, highlightbackground="#d1d5db", highlightcolor="#10a37f", padx=10, pady=8); self.cursor_task_input.grid(row=1, column=0, sticky="ew", pady=5)
-        RoundedButton(task, text="Открыть задачу в чате →", command=self.start_cursor_task, style="Accent.TButton").grid(row=1, column=1, padx=(8, 0))
+        preview_scroll = ttk.Scrollbar(center, orient="vertical", command=self.cursor_preview.yview); preview_scroll.grid(row=1, column=1, sticky="ns"); self.cursor_preview.configure(yscrollcommand=preview_scroll.set)
+        center_actions = ttk.Frame(center); center_actions.grid(row=2, column=0, sticky="ew")
+        RoundedButton(center_actions, text="Открыть файл", command=self.open_project_file).pack(side="left", padx=2)
+        RoundedButton(center_actions, text="Прикрепить к чату", command=self.attach_cursor_file).pack(side="left", padx=2)
+        right = ttk.Frame(split, padding=8); right.columnconfigure(0, weight=1); right.rowconfigure(1, weight=1)
+        cursor_head = ttk.Frame(right); cursor_head.grid(row=0, column=0, sticky="ew"); cursor_head.columnconfigure(1, weight=1)
+        ttk.Label(cursor_head, text="Модель:").grid(row=0, column=0)
+        self.cursor_model_box = ttk.Combobox(cursor_head, textvariable=self.model, values=tuple(self.model_catalog), state="readonly", width=20)
+        self.cursor_model_box.grid(row=0, column=1, sticky="ew", padx=5); self.cursor_model_box.bind("<<ComboboxSelected>>", self._model_changed)
+        RoundedButton(cursor_head, text="Добавить модель…", command=self._select_model_from_files).grid(row=0, column=2, padx=3)
+        self.cursor_chat_display = tk.Text(right, wrap="word", state="disabled", font=("Segoe UI", 10), padx=12, pady=12, background="#ffffff", foreground="#202123", borderwidth=0, highlightthickness=1, highlightbackground="#e5e7eb")
+        self.cursor_chat_display.grid(row=1, column=0, sticky="nsew", pady=(8, 4))
+        cursor_scroll = ttk.Scrollbar(right, orient="vertical", command=self.cursor_chat_display.yview); cursor_scroll.grid(row=1, column=1, sticky="ns", pady=(8, 4)); self.cursor_chat_display.configure(yscrollcommand=cursor_scroll.set)
+        self.cursor_chat_display.tag_configure("user", foreground="#08765b", spacing1=10, spacing3=6, font=("Segoe UI Semibold", 10, "bold")); self.cursor_chat_display.tag_configure("assistant", foreground="#202123", spacing1=8, spacing3=14); self.cursor_chat_display.tag_configure("system", foreground="#6b7280", spacing1=8, spacing3=8)
+        self.cursor_attached_label = tk.StringVar(value="Файл не прикреплён")
+        ttk.Label(right, textvariable=self.cursor_attached_label).grid(row=2, column=0, sticky="w")
+        cursor_attach = ttk.Frame(right); cursor_attach.grid(row=3, column=0, sticky="ew")
+        RoundedButton(cursor_attach, text="Прикрепить…", command=self.attach_chat_file).pack(side="left", padx=(0, 4)); RoundedButton(cursor_attach, text="Очистить", command=self.clear_chat_files).pack(side="left")
+        self.cursor_chat_input = tk.Text(right, height=4, wrap="word", font=("Segoe UI", 10), padx=10, pady=8, background="#ffffff", foreground="#202123", insertbackground="#202123", borderwidth=0, highlightthickness=1, highlightbackground="#d1d5db", highlightcolor="#10a37f")
+        self.cursor_chat_input.grid(row=4, column=0, sticky="ew", pady=6); self.cursor_chat_input.bind("<Return>", self._chat_enter)
+        cursor_controls = ttk.Frame(right); cursor_controls.grid(row=5, column=0, sticky="ew")
+        self.cursor_chat_send_button = RoundedButton(cursor_controls, text="Отправить", command=self.send_chat, style="Accent.TButton"); self.cursor_chat_send_button.pack(side="left", fill="x", expand=True, padx=(0, 3))
+        self.cursor_chat_edit_button = RoundedButton(cursor_controls, text="Правки файла → diff", command=self.prepare_edit); self.cursor_chat_edit_button.pack(side="left", padx=3)
+        self.cursor_chat_save_button = RoundedButton(cursor_controls, text="Сохранить ответ", command=self.save_chat_answer); self.cursor_chat_save_button.pack(side="left", padx=3)
+        split.add(left, weight=1); split.add(center, weight=3); split.add(right, weight=2)
+        self.cursor_chat_display.tag_configure("user", foreground="#08765b", spacing1=10, spacing3=6, font=("Segoe UI Semibold", 10, "bold")); self.cursor_chat_display.tag_configure("assistant", foreground="#202123", spacing1=8, spacing3=14); self.cursor_chat_display.tag_configure("system", foreground="#6b7280", spacing1=8, spacing3=8)
+        self._refresh_cursor_projects(); self._refresh_cursor_chats()
+    def _main_tab_changed(self, _event=None):
+        cursor_active = self.main_notebook.select() == str(self.cursor_tab)
+        if cursor_active:
+            self.chat_display, self.chat_input = self.cursor_chat_display, self.cursor_chat_input
+            self.chat_send_button, self.chat_edit_button, self.chat_save_button = self.cursor_chat_send_button, self.cursor_chat_edit_button, self.cursor_chat_save_button
+            self.chat_folder_label = self.cursor_folder_label; self.attached_label = self.cursor_attached_label
+            self._refresh_cursor_chats(); self._render_chat()
+        else:
+            self.chat_display, self.chat_input = self.main_chat_display, self.main_chat_input
+            self.chat_send_button, self.chat_edit_button, self.chat_save_button = self.main_chat_send_button, self.main_chat_edit_button, self.main_chat_save_button
+            self.chat_folder_label, self.attached_label = self.main_chat_folder_label, self.main_attached_label
+            self._render_chat()
+    def _refresh_cursor_projects(self):
+        if not hasattr(self, "cursor_project_box"): return
+        projects = list(dict.fromkeys(p for p in self.chat_project_dirs if Path(p).is_dir()))
+        self.cursor_projects = projects; self.cursor_project_box.configure(values=tuple(projects))
+        self.cursor_folder_label.set(self.chat_working_dir if self.chat_working_dir in projects else (projects[-1] if projects else "Выберите рабочую папку проекта"))
+    def _refresh_cursor_chats(self):
+        if not hasattr(self, "cursor_chat_box"): return
+        self.cursor_chat_ids = [c["id"] for c in sorted(self.chats, key=lambda c: c.get("updated", 0), reverse=True)]
+        self.cursor_chat_box.configure(values=tuple((c.get("title") or "Новый чат") for c in sorted(self.chats, key=lambda c: c.get("updated", 0), reverse=True)))
+        active = next((i for i, cid in enumerate(self.cursor_chat_ids) if cid == self.active_chat_id), -1)
+        if active >= 0: self.cursor_chat_box.current(active)
+    def _select_cursor_chat(self, _event=None):
+        if self.chat_busy: return
+        index = self.cursor_chat_box.current()
+        if 0 <= index < len(self.cursor_chat_ids): self._activate_chat(self.cursor_chat_ids[index])
+    def _select_cursor_project(self, _event=None):
+        path = self.cursor_folder_label.get()
+        if path and Path(path).is_dir():
+            self.chat_working_dir = str(Path(path).resolve()); self.project_file_path = None
+            self.chat_folder_label.set(self.chat_working_dir); self.config_data["chat_working_dir"] = self.chat_working_dir; write_config(self.config_data)
+            self.refresh_cursor_files(); self.refresh_project_files(); self._save_current_chat()
+    def add_cursor_project(self):
+        folder = filedialog.askdirectory(title="Добавить проект", initialdir=self.chat_working_dir if Path(self.chat_working_dir).is_dir() else str(Path.home()))
+        if not folder: return
+        folder = str(Path(folder).resolve())
+        projects = list(dict.fromkeys([*self.chat_project_dirs, folder]))
+        self.chat_project_dirs = projects
+        self.chat_working_dir = folder; self.project_file_path = None
+        self.chat_folder_label.set(folder); self.cursor_folder_label.set(folder)
+        self.config_data["chat_working_dir"] = folder; write_config(self.config_data)
+        self._refresh_cursor_projects(); self.refresh_cursor_files(); self.refresh_project_files(); self._save_current_chat()
     def refresh_cursor_files(self):
         if not hasattr(self, "cursor_tree"): return
         self.cursor_tree.delete(*self.cursor_tree.get_children())
-        root = Path(self.chat_working_dir) if self.chat_working_dir else None
-        if not root or not root.is_dir(): return
-        for path in sorted(root.rglob("*"), key=lambda item: str(item).casefold()):
-            try:
-                if not path.is_file() or any(part in {".git", "__pycache__", "node_modules", ".venv", "venv"} for part in path.relative_to(root).parts): continue
-                if path.stat().st_size > 2_000_000: continue
-                self.cursor_tree.insert("", "end", iid=str(path.resolve()), text=str(path.relative_to(root)), values=(human_size(path.stat().st_size),))
-            except OSError: continue
+        ignored = {".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build"}
+        inserted = set()
+        for root in self.chat_project_dirs:
+            base = Path(root)
+            if not base.is_dir(): continue
+            root_id = "root:" + str(base.resolve())
+            self.cursor_tree.insert("", "end", iid=root_id, text=base.name or str(base), values=("проект",), open=True)
+            count = 0
+            for path in sorted(base.rglob("*"), key=lambda item: str(item).casefold()):
+                try:
+                    relative = path.relative_to(base)
+                    if any(part in ignored for part in relative.parts): continue
+                    if not path.is_file() or path.stat().st_size > 2_000_000: continue
+                    resolved = str(path.resolve())
+                    if resolved in inserted: continue
+                    inserted.add(resolved)
+                    self.cursor_tree.insert(root_id, "end", iid=resolved, text=str(relative), values=(human_size(path.stat().st_size),))
+                    count += 1
+                    if count >= 1500: break
+                except (OSError, tk.TclError): continue
     def _preview_cursor_file(self, _event=None):
         selected = self.cursor_tree.selection()
         text = ""
-        if selected:
+        if selected and not selected[0].startswith("root:"):
             path = Path(selected[0])
+            self.project_file_path = path
+            self.chat_mode_var.set("Режим Cursor")
             try:
                 if path.suffix.lower() in SUPPORTED: text = extract_text(path)[:50000]
                 elif is_plain_text_file(path): text = read_editable_text(path)[0][:50000]
@@ -837,13 +918,20 @@ class App(tk.Tk):
             except (OSError, UnicodeError, ValueError, ImportError, zipfile.BadZipFile): text = "Не удалось прочитать файл."
         self.cursor_preview.configure(state="normal"); self.cursor_preview.delete("1.0", "end"); self.cursor_preview.insert("1.0", text or "Выберите файл проекта")
         self.cursor_preview.configure(state="disabled")
+    def attach_cursor_file(self):
+        selected = self.cursor_tree.selection()
+        if not selected or selected[0].startswith("root:"):
+            messagebox.showinfo(APP_NAME, "Выберите файл в дереве проекта."); return
+        path = Path(selected[0]); self.project_file_path = path; self.chat_edit_path = path
+        ok, reason = self._attach_path(path)
+        if not ok: messagebox.showinfo(APP_NAME, f"Не удалось прикрепить файл: {reason}")
     def start_cursor_task(self):
-        selected = self.cursor_tree.selection(); prompt = self.cursor_task_input.get("1.0", "end-1c").strip()
-        if not selected: messagebox.showinfo(APP_NAME, "Сначала выберите файл проекта."); return
-        if not prompt: messagebox.showinfo(APP_NAME, "Опишите задачу для выбранного файла."); return
-        self.project_file_path = Path(selected[0]); self.chat_mode_var.set("Режим Cursor"); self._mode_changed()
-        self.main_notebook.select(self.chat_tab)
-        self.chat_input.delete("1.0", "end"); self.chat_input.insert("1.0", prompt); self.send_chat()
+        """Compatibility helper: Cursor requests now stay in the Cursor chat pane."""
+        if not self.cursor_tree.selection(): messagebox.showinfo(APP_NAME, "Сначала выберите файл проекта."); return
+        self.main_notebook.select(self.cursor_tab)
+        self._main_tab_changed()
+        self.cursor_chat_input.focus_set()
+        self.send_chat()
     def _ensure_runtime(self):
         if self.runtime_ready:
             self.check_models()
@@ -987,13 +1075,14 @@ class App(tk.Tk):
         if not chat: return
         chat.update({"history": self.chat_history, "attachments": self.chat_attachments,
                      "mode": self.chat_mode_var.get(), "goal": self.goal_var.get(),
-                     "working_dir": self.chat_working_dir, "last_answer": self.last_assistant_answer,
+                     "working_dir": self.chat_working_dir, "project_dirs": list(self.chat_project_dirs), "last_answer": self.last_assistant_answer,
                      "updated": time.time()})
         first_user = next((item["content"].strip() for item in self.chat_history if item["role"] == "user"), "")
         if first_user and chat.get("title") in {None, "Новый чат"}:
             chat["title"] = first_user.replace("\n", " ")[:48]
         self._write_chats()
         if hasattr(self, "chat_listbox"): self._refresh_chat_list(self.active_chat_id)
+        self._refresh_cursor_chats()
 
     def _refresh_chat_list(self, select_id=None):
         if not hasattr(self, "chat_listbox"): return
@@ -1028,6 +1117,10 @@ class App(tk.Tk):
         self.goal_var.set(chat.get("goal", "")); self.last_assistant_answer = chat.get("last_answer", "")
         saved_dir = chat.get("working_dir", self.config_data.get("chat_working_dir", ""))
         self.chat_working_dir = saved_dir if saved_dir and Path(saved_dir).is_dir() else ""
+        saved_projects = chat.get("project_dirs", [])
+        self.chat_project_dirs = list(dict.fromkeys(p for p in saved_projects if isinstance(p, str) and Path(p).is_dir()))
+        if self.chat_working_dir and self.chat_working_dir not in self.chat_project_dirs: self.chat_project_dirs.append(self.chat_working_dir)
+        if not self.chat_project_dirs and self.chat_working_dir: self.chat_project_dirs = [self.chat_working_dir]
         self.chat_folder_label.set(self.chat_working_dir or "Рабочая папка не выбрана")
         if hasattr(self, "cursor_folder_label"):
             self.cursor_folder_label.set(self.chat_working_dir or "Выберите рабочую папку проекта")
@@ -1210,6 +1303,9 @@ class App(tk.Tk):
         else:
             self.new_chat()
         self.chat_input.focus_set()
+        self.main_chat_display, self.main_chat_input = self.chat_display, self.chat_input
+        self.main_chat_send_button, self.main_chat_edit_button, self.main_chat_save_button = self.chat_send_button, self.chat_edit_button, self.chat_save_button
+        self.main_chat_folder_label, self.main_attached_label = self.chat_folder_label, self.attached_label
 
     def _chat_enter(self, event):
         if event.state & 0x0001: return
@@ -1230,23 +1326,23 @@ class App(tk.Tk):
 
     def _render_chat(self):
         if not self.chat_window or not self.chat_window.winfo_exists(): return
-        self.chat_display.configure(state="normal"); self.chat_display.delete("1.0", "end")
-        if not self.chat_history:
-            mode_hint = {"Работа по цели": "Опишите цель в поле выше — чат сохранит её и будет помогать двигаться к результату по шагам.",
-                         "Режим Cursor": "Выберите рабочую папку проекта. Откройте файл в дереве, смотрите код и задавайте задачу. Изменения появятся в diff и применятся только после подтверждения.",
-                         "Обычный чат": "Задавайте вопросы и прикрепляйте файлы из рабочей папки."}.get(self.chat_mode_var.get(), "Задавайте вопросы.")
-            self.chat_display.insert("end", f"Локальный чат\n\n{mode_hint}\n\nМодель не имеет доступа к файловой системе и не может удалять файлы.", "system")
-        for item in self.chat_history:
-            label = "Вы" if item["role"] == "user" else "Локальная модель"
-            self.chat_display.insert("end", label + "\n", item["role"])
-            self.chat_display.insert("end", item["content"] + "\n\n", item["role"])
-        self.chat_display.configure(state="disabled"); self.chat_display.see("end")
+        for display in (getattr(self, "main_chat_display", None), getattr(self, "cursor_chat_display", None)):
+            if not display or not display.winfo_exists(): continue
+            display.configure(state="normal"); display.delete("1.0", "end")
+            if not self.chat_history:
+                mode_hint = {"Работа по цели": "Опишите цель в поле выше — чат поможет двигаться по шагам.", "Режим Cursor": "Выберите проект и файл. Запрос отправьте прямо в этой панели; правки появятся в diff и применятся только после подтверждения.", "Обычный чат": "Задавайте вопросы и прикрепляйте файлы."}.get(self.chat_mode_var.get(), "Задавайте вопросы.")
+                display.insert("end", f"Локальный чат\n\n{mode_hint}\n\nМодель не имеет доступа к файловой системе и не может удалять файлы.", "system")
+            for item in self.chat_history:
+                label = "Вы" if item["role"] == "user" else "Локальная модель"
+                display.insert("end", label + "\n", item["role"]); display.insert("end", item["content"] + "\n\n", item["role"])
+            display.configure(state="disabled"); display.see("end")
 
     def new_chat(self):
         if self.chat_busy: return
         self._save_current_chat()
         chat = {"id": uuid.uuid4().hex, "title": "Новый чат", "history": [], "attachments": [],
-                "mode": "Обычный чат", "goal": "", "working_dir": self.chat_working_dir, "updated": time.time()}
+                "mode": "Обычный чат", "goal": "", "working_dir": self.chat_working_dir,
+                "project_dirs": list(self.chat_project_dirs), "updated": time.time()}
         self.chats.insert(0, chat); self.active_chat_id = chat["id"]
         self._activate_chat(chat["id"]); self._write_chats()
         self.chat_input.focus_set()
@@ -1303,9 +1399,9 @@ class App(tk.Tk):
         generic_text = ext not in SUPPORTED and is_plain_text_file(path)
         if path.suffix.lower() not in SUPPORTED and not generic_text: return False, "для этого бинарного формата пока нет локального парсера"
         if self.chat_mode_var.get() == "Режим Cursor":
-            if not self.chat_working_dir: return False, "сначала задайте рабочую папку проекта"
-            try: path.relative_to(Path(self.chat_working_dir).resolve())
-            except ValueError: return False, "в режиме кода разрешены только файлы из рабочей папки"
+            roots = [Path(folder).resolve() for folder in self.chat_project_dirs if Path(folder).is_dir()]
+            if not roots: return False, "сначала добавьте папку проекта"
+            if not any(path.is_relative_to(root) for root in roots): return False, "в режиме кода разрешены только файлы из добавленных проектов"
         try:
             if path.stat().st_size > 50_000_000: return False, "больше 50 МБ"
             if is_image and path.stat().st_size > 20_000_000: return False, "изображение больше 20 МБ"
@@ -1343,7 +1439,7 @@ class App(tk.Tk):
             if goal: system += "\nЦель пользователя: " + goal
         elif self.chat_mode_var.get() == "Режим Cursor":
             system += "\nРежим Cursor: анализируй только открытый в редакторе файл и явно приложенные файлы. Помогай с кодом и предлагай точные правки. Рабочая папка не означает автоматический доступ к остальным файлам проекта."
-            if self.chat_working_dir: system += "\nРабочий проект: " + Path(self.chat_working_dir).name
+            if self.chat_project_dirs: system += "\nПроекты: " + ", ".join(Path(p).name for p in self.chat_project_dirs)
             active_path = getattr(self, "project_file_path", None)
             if active_path and active_path.is_file() and not any(item.get("path") == str(active_path) for item in self.chat_attachments):
                 try:

@@ -12,7 +12,7 @@ The user explicitly chooses folders to index. The index is stored in `%APPDATA%\
 
 ## Cursor workspace
 
-Cursor is a separate main-window tab. The user selects a working folder, browses its files, previews one file, chooses a model, and enters a task. The task is handed to the chat workflow with the selected file as context. Text/document changes show a review preview and require explicit confirmation before saving. The model cannot directly access the project filesystem or run code.
+Cursor is a three-pane main-window tab: project roots and files on the left, the selected file preview in the center, and the active local chat on the right. One chat can include several project folders at once, such as a source project and a new destination project. Each chat remembers its own project roots and conversation; users can switch chats without losing their workspace. The active file and explicitly attached files provide context. Text/document changes show a review preview and require explicit confirmation before saving. The model cannot directly access the project filesystem or run code.
 
 ## Safety and office files
 
