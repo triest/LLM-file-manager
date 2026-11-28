@@ -15,6 +15,10 @@ class TextAndSearchTests(unittest.TestCase):
     def test_keyboard_layout_search_keeps_subject_terms(self):
         self.assertEqual(app.extract_file_search_query("Yfqlb nfv afqk c rjynhfrnfvb"), ["контрактами"])
 
+    def test_keyboard_layout_search_preserves_literal_filename(self):
+        terms = app.extract_file_search_query("Yfqlb nfv afqk contract-sample")
+        self.assertIn("contract-sample", terms)
+
     def test_text_extractors_handle_html_and_bad_office_archives(self):
         with tempfile.TemporaryDirectory() as directory:
             html = Path(directory) / "page.html"
