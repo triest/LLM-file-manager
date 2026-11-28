@@ -352,19 +352,28 @@ def extract_json_object(response: str):
 def extract_file_search_query(prompt: str):
     """Recognize a natural-language request to find a local file and retain identifying terms."""
     lowered = prompt.casefold()
+    original = lowered
+    translated_layout = False
     intents = ("найди", "найти", "поищи", "отыщи", "где лежит", "где находится", "где найти")
     if not any(word in lowered for word in intents):
         # Users sometimes type Russian while the keyboard is still in English layout.
         en = "qwertyuiop[]asdfghjkl;'zxcvbnm,."
         ru = "йцукенгшщзхъфывапролджэячсмитьбю"
         translated = lowered.translate(str.maketrans(en, ru))
-        if any(word in translated for word in intents): lowered = translated
+        if any(word in translated for word in intents):
+            lowered = translated
+            translated_layout = True
     if not any(word in lowered for word in intents): return None
     local_file_context = ("комп" in lowered or "диск" in lowered or "папк" in lowered or "файл" in lowered or
                           "документ" in lowered or "где лежит" in lowered or "где находится" in lowered)
     if not local_file_context: return None
     stop = {"найди", "найти", "поищи", "отыщи", "где", "лежит", "находится", "у", "меня", "на", "в", "во", "по", "про", "для", "из", "с", "от", "там", "файл", "файлы", "документ", "документы", "моем", "моём", "компе", "компьютере", "диске", "где-то", "гдето", "пожалуйста", "мне", "его", "ее", "её", "тот", "этот", "и", "или", "моя", "моей", "мой", "мое", "моё"}
     terms = [word for word in re.findall(r"[\w.-]+", lowered, flags=re.UNICODE) if len(word) > 1 and word not in stop]
+    if translated_layout:
+        # Keep literal ASCII identifiers (filenames, extensions, model IDs) intact
+        # when the surrounding Russian request was typed with the wrong layout.
+        literals = re.findall(r"(?=[A-Za-z0-9._-]*[A-Za-z])(?=[A-Za-z0-9._-]*[0-9._-])[A-Za-z0-9][A-Za-z0-9._-]*", original)
+        terms.extend(token for token in literals if token.casefold() not in terms)
     return terms or []
 
 
