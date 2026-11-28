@@ -40,6 +40,9 @@ APP_NAME = "Локальный файловый менеджер"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 SUPPORTED = {".txt", ".md", ".rst", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".py", ".js", ".ts", ".css", ".log", ".ini", ".yaml", ".yml", ".toml", ".rtf", ".docx", ".xlsx", ".xlsm", ".xls", ".xlsb", ".pptx", ".odt", ".ods", ".odp", ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".sql", ".sh", ".ps1", ".bat", ".cs", ".java", ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".jsx", ".tsx", ".vue", ".svelte", ".php", ".rb", ".swift", ".kt", ".properties", ".env"}
 MAX_TEXT = 500_000
+MAX_REQUEST_CHARS = 90_000
+CUDA_CONTEXT_TOKENS = 65_536
+CUDA_ORIGINAL_CONTEXT_TOKENS = 32_768
 CUDA_RUNTIME_VERSION = "b12780"
 CUDA_RUNTIME_URL = f"https://github.com/ggml-org/llama.cpp/releases/download/{CUDA_RUNTIME_VERSION}/llama-{CUDA_RUNTIME_VERSION}-bin-win-cuda-12.4-x64.zip"
 CUDA_RUNTIME_DIR = Path(os.environ.get("APPDATA", Path.home())) / "LocalFileManager" / "runtime" / f"llama-cpp-{CUDA_RUNTIME_VERSION}"
@@ -533,7 +536,7 @@ def local_chat(models_dir: str | Path, model: str, messages: list[dict], timeout
         log_event(f"CUDA_DEVICE_ERROR model={model!r} exit={device_check.returncode} detail={detail!r}")
         raise RuntimeError("CUDA-видеокарта не обнаружена встроенным движком. Проверьте драйвер NVIDIA и журнал приложения.\n" + detail)
     cuda_device = cuda_match.group(1)
-    log_event(f"CUDA_DEVICE_SELECTED name={cuda_device} devices={device_check.stdout.strip()!r} gpu_layers=all context_tokens=32768 kv_cache=q4_0")
+    log_event(f"CUDA_DEVICE_SELECTED name={cuda_device} devices={device_check.stdout.strip()!r} gpu_layers=all context_tokens={CUDA_CONTEXT_TOKENS} kv_cache=q4_0 rope_scaling=yarn scale=2 orig_ctx={CUDA_ORIGINAL_CONTEXT_TOKENS}")
     system = next((str(item.get("content", "")) for item in compacted_messages if item.get("role") == "system"), "Отвечай на языке пользователя.")
     turns = [item for item in compacted_messages if item.get("role") != "system"]
     prompt = "\n\n".join(("Пользователь" if item.get("role") == "user" else "Ассистент") + ":\n" + str(item.get("content", "")) for item in turns)
@@ -550,7 +553,9 @@ def local_chat(models_dir: str | Path, model: str, messages: list[dict], timeout
             temp = Path(temp_dir); prompt_file = temp / "prompt.txt"; system_file = temp / "system.txt"
             prompt_file.write_text(prompt, encoding="utf-8"); system_file.write_text(system, encoding="utf-8")
             command = [str(executable), "-m", str(model_path), "-f", str(prompt_file), "--system-prompt-file", str(system_file),
-                       "-n", "2048", "--temp", temperature, "-dev", cuda_device, "-ngl", "999", "-c", "32768",
+                       "-n", "2048", "--temp", temperature, "-dev", cuda_device, "-ngl", "999", "-c", str(CUDA_CONTEXT_TOKENS),
+                       "--rope-scaling", "yarn", "--rope-scale", "2", "--yarn-orig-ctx", str(CUDA_ORIGINAL_CONTEXT_TOKENS),
+                       "-ctk", "q4_0", "-ctv", "q4_0", "-fa", "on", "--batch-size", "512",
                        "--simple-io", "--conversation", "--single-turn", "--no-display-prompt"]
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                        encoding="utf-8", errors="replace",
@@ -584,11 +589,12 @@ def local_chat(models_dir: str | Path, model: str, messages: list[dict], timeout
             finally:
                 with _INFERENCE_PROCESS_LOCK:
                     if _INFERENCE_PROCESS is process: _INFERENCE_PROCESS = None
-        diagnostics = "\n".join(line.strip() for line in result.stderr.splitlines() if line.strip())[-5000:]
-        if diagnostics: log_event(f"LLM_RUNTIME_DIAGNOSTICS model={model!r} device={cuda_device}\n{diagnostics}")
+        # Runtime output may echo user or attachment text. Keep only safe diagnostic metadata in app.log.
+        diagnostic_lines = sum(bool(line.strip()) for line in result.stderr.splitlines())
+        if diagnostic_lines: log_event(f"LLM_RUNTIME_DIAGNOSTICS model={model!r} device={cuda_device} lines={diagnostic_lines}")
         if result.returncode:
             detail = (result.stderr or result.stdout)[-2000:]
-            log_event(f"LLM_REQUEST_ERROR model={model!r} device={cuda_device} exit={result.returncode} detail={detail!r}")
+            log_event(f"LLM_REQUEST_ERROR model={model!r} device={cuda_device} exit={result.returncode}")
             if "qwen3vl.rope.dimension_sections" in detail:
                 raise RuntimeError(
                     "Этот файл qwen3-vl взят из хранилища Ollama и использует его специальный GGUF-формат. "
@@ -614,7 +620,7 @@ def local_chat(models_dir: str | Path, model: str, messages: list[dict], timeout
         return output
 
 
-def compact_chat_messages(messages: list[dict], max_chars=90000):
+def compact_chat_messages(messages: list[dict], max_chars=MAX_REQUEST_CHARS):
     """Trim old turns to fit the local context window; never silently truncate current content."""
     copied = [dict(message) for message in messages]
     system = next((item for item in copied if item.get("role") == "system"), {"role": "system", "content": ""})
@@ -634,8 +640,20 @@ def compact_chat_messages(messages: list[dict], max_chars=90000):
         kept.insert(0, message); budget -= cost + 2
     omitted = len(turns) - len(kept)
     if omitted:
-        system = dict(system)
-        system["content"] = str(system.get("content", "")) + f"\n\nДля ограничения контекста пропущены {omitted} самых старых сообщений переписки."
+        base_system = str(system.get("content", ""))
+        while omitted:
+            notice = f"\n\nДля ограничения контекста пропущены {omitted} самых старых сообщений переписки."
+            candidate_system = dict(system)
+            candidate_system["content"] = base_system + notice
+            candidate_size = len(candidate_system["content"]) + sum(len(str(item.get("content", ""))) for item in kept)
+            if candidate_size <= max_chars:
+                system = candidate_system
+                break
+            if len(kept) <= 1:
+                # Keep the system rules and current user request intact when even the notice cannot fit.
+                break
+            kept.pop(0)
+            omitted = len(turns) - len(kept)
     compacted = [system] + kept
     sent_chars = len(str(system.get("content", ""))) + sum(len(str(item.get("content", ""))) for item in kept)
     return compacted, original_chars, sent_chars
@@ -1447,7 +1465,7 @@ class App(tk.Tk):
                 if not answer or not answer.strip(): raise ValueError("Модель вернула пустое дополнение")
                 self.after(0, lambda: self._show_cursor_completion(record, marker, answer))
             except Exception as e:
-                log_event(f"CURSOR_COMPLETION_ERROR model={model!r} error={str(e)!r}", exc_info=True)
+                log_event(f"CURSOR_COMPLETION_ERROR model={model!r} error_type={type(e).__name__}")
                 self.after(0, lambda error=str(e): self._cursor_completion_error(record, marker, error))
         threading.Thread(target=work, daemon=True).start()
     def _cursor_completion_error(self, record, marker, error):
@@ -1982,7 +2000,7 @@ class App(tk.Tk):
                 answer = local_chat(self.model_dir_var.get(), model, [{"role": "user", "content": prompt}]) or "Пустой ответ"
                 self.after(0, lambda: self._legacy_ai_done(answer))
             except Exception as e:
-                log_event(f"LEGACY_AI_REQUEST_ERROR model={model!r} error={str(e)!r}", exc_info=True)
+                log_event(f"LEGACY_AI_REQUEST_ERROR model={model!r} error_type={type(e).__name__}")
                 self.after(0, lambda error=str(e): self._legacy_ai_error(error))
             self.events.put("Готово")
         threading.Thread(target=work, daemon=True).start()
@@ -2371,17 +2389,17 @@ class App(tk.Tk):
             if path.stat().st_size > 50_000_000: return False, "больше 50 МБ"
             if is_image and path.stat().st_size > 20_000_000: return False, "изображение больше 20 МБ"
             text = (f"Изображение {path.name}; будет передано локальной модели с поддержкой зрения." if is_image else
-                    read_editable_text(path)[0][:80000] if generic_text else
-                    excel_workbook_text(path, 80000) if path.suffix.lower() in {".xlsx", ".xlsm", ".xls", ".xlsb"} else extract_text(path))
+                    read_editable_text(path)[0] if generic_text else
+                    excel_workbook_text(path, MAX_REQUEST_CHARS + 1) if path.suffix.lower() in {".xlsx", ".xlsm", ".xls", ".xlsb"} else extract_text(path))
         except (OSError, UnicodeError): return False, "не удалось прочитать файл"
         if text.startswith("[Для "):
             return False, text[1:-1]
         if (not text and ext not in EDITABLE_TEXT and not generic_text) or text.startswith("[Для извлечения текста из PDF"):
             return False, "текст не извлечён"
-        remaining = 80000 - sum(len(item["text"]) for item in self.chat_attachments)
-        if remaining <= 0: return False, "общий лимит контекста 80 000 символов"
-        attached = text[:remaining]
-        self.chat_attachments.append({"name": path.name, "path": str(path), "text": attached, "image": is_image, "truncated": len(attached) < len(text)})
+        remaining = MAX_REQUEST_CHARS - sum(len(item["text"]) for item in self.chat_attachments)
+        if len(text) > remaining:
+            return False, f"файл занимает {len(text):,} символов, доступно {max(0, remaining):,}; содержимое не обрезано и не прикреплено"
+        self.chat_attachments.append({"name": path.name, "path": str(path), "text": text, "image": is_image})
         self.chat_edit_path = path; self._update_attachment_label(); self._save_current_chat()
         return True, ""
 
@@ -2425,7 +2443,7 @@ class App(tk.Tk):
                                    "Selected image: " + active_path.name if active_path.suffix.lower() in IMAGE_EXTS else
                                    excel_workbook_text(active_path, 50000) if active_path.suffix.lower() in {".xlsx", ".xlsm", ".xls", ".xlsb"}
                                    else extract_text(active_path) if active_path.suffix.lower() in SUPPORTED
-                                   else read_editable_text(active_path)[0][:50000] if is_plain_text_file(active_path)
+                                   else read_editable_text(active_path)[0] if is_plain_text_file(active_path)
                                    else "Binary file selected; no local content adapter is available.")
                     file_context.append(f"--- Открытый файл проекта: {active_path.name} ---\n{active_text}")
                 except (OSError, UnicodeError, ValueError, ImportError, zipfile.BadZipFile): pass
@@ -2434,8 +2452,8 @@ class App(tk.Tk):
             if selected_row:
                 active_path = Path(selected_row[0])
                 try:
-                    active_text = selected_row[5] or ("К сообщению прикреплено изображение; анализируй его, если модель поддерживает зрение." if active_path.suffix.lower() in IMAGE_EXTS else excel_workbook_text(active_path, 50000) if active_path.suffix.lower() in {".xlsx", ".xlsm", ".xls", ".xlsb"} else extract_text(active_path) if active_path.suffix.lower() in SUPPORTED else read_editable_text(active_path)[0][:50000] if is_plain_text_file(active_path) else "")
-                    if active_text: file_context.append(f"Пользователь выбрал найденный локальный файл. Отвечай по его содержимому:\n--- {active_path.name} ---\n{active_text[:50000]}")
+                    active_text = selected_row[5] or ("К сообщению прикреплено изображение; анализируй его, если модель поддерживает зрение." if active_path.suffix.lower() in IMAGE_EXTS else excel_workbook_text(active_path, MAX_REQUEST_CHARS + 1) if active_path.suffix.lower() in {".xlsx", ".xlsm", ".xls", ".xlsb"} else extract_text(active_path) if active_path.suffix.lower() in SUPPORTED else read_editable_text(active_path)[0] if is_plain_text_file(active_path) else "")
+                    if active_text: file_context.append(f"Пользователь выбрал найденный локальный файл. Отвечай по его содержимому:\n--- {active_path.name} ---\n{active_text}")
                 except (OSError, UnicodeError, ValueError, ImportError, zipfile.BadZipFile): pass
         if self.chat_attachments:
             file_context.append("Пользователь передал содержимое файлов только для этой беседы. Рабочая папка чата: " + (Path(self.chat_working_dir).name if self.chat_working_dir else "не выбрана"))
@@ -2462,6 +2480,9 @@ class App(tk.Tk):
 
     def send_chat(self):
         if self.chat_busy: return
+        if any(item.get("truncated") for item in self.chat_attachments):
+            messagebox.showerror("Неполное вложение", "В этой переписке сохранено старое вложение, обрезанное по лимиту. Удалите его и прикрепите исходный файл заново, чтобы не отправлять неполный текст.")
+            return
         prompt = self.chat_input.get("1.0", "end-1c").strip()
         if not prompt: return
         search_terms = extract_file_search_query(prompt)
@@ -2592,7 +2613,7 @@ class App(tk.Tk):
                 if self._closing:
                     log_event(f"UI_REQUEST_ABORTED_ON_EXIT model={model!r} purpose={purpose}")
                     return
-                log_event(f"UI_REQUEST_FAILED model={model!r} purpose={purpose} error={str(e)!r}", exc_info=True)
+                log_event(f"UI_REQUEST_FAILED model={model!r} purpose={purpose} error_type={type(e).__name__}")
                 try: self.after(0, lambda error=str(e): self._chat_error(error, request_chat_id))
                 except tk.TclError: pass
         threading.Thread(target=work, daemon=True).start()
@@ -2670,7 +2691,7 @@ class App(tk.Tk):
         self.active_request_purpose = None; self.active_request_chat_id = None
         self._sync_chat_controls()
         self.status.set("Модель не ответила — подробности в журнале")
-        log_event(f"CHAT_VISIBLE_ERROR error={error!r}")
+        log_event("CHAT_VISIBLE_ERROR")
         if request_chat_id and request_chat_id != self.active_chat_id:
             chat = next((item for item in self.chats if item.get("id") == request_chat_id), None)
             if chat is not None:
